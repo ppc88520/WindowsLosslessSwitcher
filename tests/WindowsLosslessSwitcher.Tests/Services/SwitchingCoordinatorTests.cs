@@ -5,7 +5,7 @@ using Xunit;
 
 namespace WindowsLosslessSwitcher.Tests.Services;
 
-public sealed class SwitchingCoordinatorTests
+public sealed partial class SwitchingCoordinatorTests
 {
     private static readonly AudioDeviceInfo DefaultDevice = new("default-device", "USB DAC", true);
     private static readonly AudioFormatCandidate CurrentFormat = new(44100, 16, 2);
@@ -1305,7 +1305,7 @@ public sealed class SwitchingCoordinatorTests
         public void RaiseTrackChanged(TrackSnapshot track) => TrackChanged?.Invoke(this, track);
     }
 
-    private sealed class TestMediaTransportController : IMediaTransportController
+    private class TestMediaTransportController : IMediaTransportController, IPreviousTrackRestarter
     {
         public int PauseCallCount { get; private set; }
 
@@ -1331,15 +1331,30 @@ public sealed class SwitchingCoordinatorTests
 
         public Action? PauseInvoked { get; set; }
 
+        public Action? PauseAccepted { get; set; }
+
+        public List<string> CommandHistory { get; } = new();
+
+        public Action<string>? CommandObserver { get; set; }
+
+        private void RecordCommand(string command)
+        {
+            CommandHistory.Add(command);
+            CommandObserver?.Invoke(command);
+        }
+
         public TimeSpan? TimelinePosition { get; set; } = TimeSpan.FromSeconds(12);
 
         public Queue<MediaTransportPlaybackStatus> PlaybackStatusSequence { get; } = new();
 
         public int GetPlaybackStateCallCount { get; private set; }
 
+        public Action? PlaybackStateRead { get; set; }
+
         public MediaTransportState GetPlaybackState()
         {
             GetPlaybackStateCallCount++;
+            PlaybackStateRead?.Invoke();
             var status = PlaybackStatusSequence.Count switch
             {
                 0 => IsPlaying ? MediaTransportPlaybackStatus.Playing : MediaTransportPlaybackStatus.Paused,
@@ -1358,10 +1373,12 @@ public sealed class SwitchingCoordinatorTests
         public Task<bool> TryPauseAsync(CancellationToken cancellationToken)
         {
             PauseCallCount++;
+            RecordCommand("pause");
             PauseInvoked?.Invoke();
             if (PauseResult)
             {
                 IsPlaying = false;
+                PauseAccepted?.Invoke();
             }
 
             return Task.FromResult(PauseResult);
@@ -1370,6 +1387,7 @@ public sealed class SwitchingCoordinatorTests
         public Task<bool> TryPlayAsync(CancellationToken cancellationToken)
         {
             PlayCallCount++;
+            RecordCommand("play");
             PlayInvoked?.Invoke();
             if (PlayFailuresBeforeSuccess > 0)
             {
@@ -1395,6 +1413,37 @@ public sealed class SwitchingCoordinatorTests
             }
 
             return Task.FromResult(TogglePlayPauseResult);
+        }
+
+        public int GuardedRestartCallCount { get; private set; }
+
+        public TrackSnapshot? LastRestartExpectedTrack { get; private set; }
+
+        public TrackSnapshot? LastRestartPrecedingTrack { get; private set; }
+
+        public PreviousRestartResult GuardedRestartResult { get; set; } = new(true, true, "Guarded previous confirmed the original track at 0:00.");
+
+        public bool ApplyRestartToTimeline { get; set; } = true;
+
+        public bool HonorGuardCancellationAfterCompletion { get; set; } = true;
+
+        public Func<TrackSnapshot, TrackSnapshot?, CancellationToken, Task<PreviousRestartResult>>? GuardedRestartHandler { get; set; }
+
+        public async Task<PreviousRestartResult> TryRestartWithPreviousAsync(TrackSnapshot expectedTrack, TrackSnapshot? precedingTrack, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            GuardedRestartCallCount++;
+            LastRestartExpectedTrack = expectedTrack;
+            LastRestartPrecedingTrack = precedingTrack;
+            RecordCommand("guarded-previous");
+            var result = GuardedRestartHandler is null
+                ? GuardedRestartResult
+                : await GuardedRestartHandler(expectedTrack, precedingTrack, cancellationToken);
+            if (HonorGuardCancellationAfterCompletion)
+                cancellationToken.ThrowIfCancellationRequested();
+            if (result.Restarted && ApplyRestartToTimeline)
+                TimelinePosition = TimeSpan.Zero;
+            return result;
         }
 
         public int ChangePlaybackPositionCallCount { get; private set; }
@@ -1455,6 +1504,8 @@ public sealed class SwitchingCoordinatorTests
         public bool? MasterMute { get; set; } = false;
 
         public List<bool> MuteCalls { get; } = new();
+
+        public Action<bool>? MuteInvoked { get; set; }
 
         public Func<bool?>? RenderSessionActiveProvider { get; set; }
 
@@ -1524,6 +1575,7 @@ public sealed class SwitchingCoordinatorTests
         {
             MuteCalls.Add(muted);
             MasterMute = muted;
+            MuteInvoked?.Invoke(muted);
             return true;
         }
 

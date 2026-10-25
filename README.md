@@ -70,6 +70,8 @@ Successful catalog matches are kept in a versioned local cache, scoped to the Ap
 
 When a switch is needed, the app mutes the device the instant the track changes (so nothing is audible at the old format) and applies the new shared-mode format live, under Apple Music's running audio stream. Windows invalidates the stream and Apple Music rebuilds it on its own within a few seconds; once real audio is confirmed, the app unmutes. If playback ever stalls anyway, an escalating recovery (nudge → skip → as a last resort an automatic Apple Music restart) brings it back.
 
+An optional **Restart track after sample-rate changes (experimental)** setting pauses before a rate change and keeps the output device muted until the same track is confirmed back at its beginning. It is disabled by default, can take ten seconds or longer, and has stricter failure handling than normal playback recovery. See [guarded track restart](GUARDED_TRACK_RESTART.md) for the behavior, limitations, and manual test procedure.
+
 Do also note that:
 
 - A track that needs a format switch starts with a few seconds of silence — that is the mute/switch/rebuild cycle doing its job. Audio then comes in at the correct format a few seconds into the track, and its ending is not cut short. Tracks that don't need a switch start instantly.
@@ -93,8 +95,12 @@ Settings are stored at `%APPDATA%\WindowsLosslessSwitcher\settings.json`. The ca
   "launchAtLogin": false,
 
   // When true, the app also switches the bit depth of the target device (e.g. 16-bit → 24-bit).
-  // When false, only the sample rate is adjusted.
+  // When false, use defaultBitDepth rather than following each track's bit depth.
   "switchBitDepth": true,
+
+  // Experimental: pause before a sample-rate change, then restart the same track.
+  // Includes muted preparation of at least ten seconds; unchanged-rate tracks keep normal behavior.
+  "restartTrackAfterSampleRateChange": false,
 
   // Default bit depth applied when the resolved format does not specify one.
   // Accepted values: 16 or 24.

@@ -19,6 +19,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     private string? _selectedDeviceId;
     private bool _launchAtLogin;
     private bool _switchBitDepth;
+    private bool _restartTrackAfterSampleRateChange;
     private bool _preferClosestSampleRateMultiple;
     private int _defaultBitDepth = 24;
     private bool _enableSwitchToasts;
@@ -185,6 +186,12 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
             OnPropertyChanged(nameof(UseFixedBitDepthSelection));
         }
+    }
+
+    public bool RestartTrackAfterSampleRateChange
+    {
+        get => _restartTrackAfterSampleRateChange;
+        set => SetField(ref _restartTrackAfterSampleRateChange, value);
     }
 
     public int DefaultBitDepth

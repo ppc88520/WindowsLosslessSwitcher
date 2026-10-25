@@ -23,6 +23,7 @@ public sealed class SettingsServiceTests
                 PinnedDeviceId = "device-1",
                 LaunchAtLogin = true,
                 SwitchBitDepth = false,
+                RestartTrackAfterSampleRateChange = true,
                 DefaultBitDepth = 16,
                 EnableSwitchToasts = true,
                 IncludeTrackMetadataInSwitchToasts = true,
@@ -49,6 +50,8 @@ public sealed class SettingsServiceTests
             Assert.Contains("\"originalTarget\"", json);
             Assert.DoesNotContain("originalTargetDeviceId", json, StringComparison.Ordinal);
             Assert.Equal(settings.OriginalTarget, loaded.OriginalTarget);
+            Assert.Contains("\"restartTrackAfterSampleRateChange\": true", json);
+            Assert.True(loaded.RestartTrackAfterSampleRateChange);
             Assert.Equal(60, loaded.FormatCacheRefreshDays);
             Assert.Equal([44100, 48000, 96000], loaded.AllowedSampleRates);
             Assert.Equal([16, 24], loaded.AllowedBitDepths);
@@ -62,6 +65,35 @@ public sealed class SettingsServiceTests
             {
                 Directory.Delete(settingsDirectory, recursive: true);
             }
+        }
+    }
+
+    [Fact]
+    public void Load_ExistingSettingsLeaveExperimentalRestartDisabledWithoutRewritingFile()
+    {
+        var settingsDirectory = Path.Combine(
+            Path.GetTempPath(), "WindowsLosslessSwitcher.Tests", Guid.NewGuid().ToString("N"));
+        const string originalJson = "{\"switchBitDepth\":false,\"defaultBitDepth\":24,\"launchAtLogin\":true}";
+
+        try
+        {
+            Directory.CreateDirectory(settingsDirectory);
+            var service = new SettingsService(settingsDirectory);
+            File.WriteAllText(service.GetSettingsPath(), originalJson);
+
+            var loaded = service.Load();
+
+            Assert.False(new AppSettings().RestartTrackAfterSampleRateChange);
+            Assert.False(loaded.RestartTrackAfterSampleRateChange);
+            Assert.False(loaded.SwitchBitDepth);
+            Assert.Equal(24, loaded.DefaultBitDepth);
+            Assert.True(loaded.LaunchAtLogin);
+            Assert.Equal(originalJson, File.ReadAllText(service.GetSettingsPath()));
+        }
+        finally
+        {
+            if (Directory.Exists(settingsDirectory))
+                Directory.Delete(settingsDirectory, recursive: true);
         }
     }
 

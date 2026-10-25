@@ -29,6 +29,12 @@ public sealed class AppSettings
 
     public bool SwitchBitDepth { get; set; } = true;
 
+    /// <summary>
+    /// Opt-in experiment: pause before a sample-rate change and hold output muted until
+    /// the same track is confirmed at its beginning. Existing settings leave this disabled.
+    /// </summary>
+    public bool RestartTrackAfterSampleRateChange { get; set; }
+
     public bool PreferClosestSampleRateMultiple { get; set; }
 
     /// <summary>

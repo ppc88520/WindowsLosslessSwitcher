@@ -138,6 +138,29 @@
         </Border>
       </Grid>
 
+      <Grid Margin="0,0,0,14">
+        <Grid.ColumnDefinitions>
+          <ColumnDefinition Width="*" />
+          <ColumnDefinition Width="Auto" />
+        </Grid.ColumnDefinitions>
+        <StackPanel Grid.Column="0">
+          <TextBlock FontSize="{StaticResource Nocturne.FontSize.Body}"
+                     Text="Restart track after sample-rate changes (experimental)"
+                     TextWrapping="Wrap" />
+          <TextBlock Margin="0,2,0,0"
+                     FontSize="{StaticResource Nocturne.FontSize.Small}"
+                     Foreground="{StaticResource Nocturne.Brush.Text40}"
+                     Text="Pauses the song, mutes the output device during preparation, then restarts the current track. Allow 10 seconds or more."
+                     TextWrapping="Wrap" />
+        </StackPanel>
+        <ToggleButton Grid.Column="1"
+                      Margin="12,0,0,0"
+                      VerticalAlignment="Center"
+                      IsChecked="{Binding RestartTrackAfterSampleRateChange}"
+                      AutomationProperties.Name="Restart track after sample-rate changes (experimental)"
+                      Style="{StaticResource Nocturne.ToggleSwitch}" />
+      </Grid>
+
       <Grid Margin="0,0,0,10">
         <Grid.ColumnDefinitions>
           <ColumnDefinition Width="*" />

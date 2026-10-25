@@ -72,6 +72,7 @@ public partial class App : Application
         _viewModel.SelectedDeviceId = _settings.PinnedDeviceId;
         _viewModel.LaunchAtLogin = _settings.LaunchAtLogin;
         _viewModel.SwitchBitDepth = _settings.SwitchBitDepth;
+        _viewModel.RestartTrackAfterSampleRateChange = _settings.RestartTrackAfterSampleRateChange;
         _viewModel.PreferClosestSampleRateMultiple = _settings.PreferClosestSampleRateMultiple;
         _viewModel.DefaultBitDepth = _settings.DefaultBitDepth;
         _viewModel.EnableSwitchToasts = _settings.EnableSwitchToasts;
@@ -299,6 +300,7 @@ public partial class App : Application
             e.PropertyName is not nameof(MainWindowViewModel.SelectedDeviceId) &&
             e.PropertyName is not nameof(MainWindowViewModel.LaunchAtLogin) &&
             e.PropertyName is not nameof(MainWindowViewModel.SwitchBitDepth) &&
+            e.PropertyName is not nameof(MainWindowViewModel.RestartTrackAfterSampleRateChange) &&
             e.PropertyName is not nameof(MainWindowViewModel.PreferClosestSampleRateMultiple) &&
             e.PropertyName is not nameof(MainWindowViewModel.DefaultBitDepth) &&
             e.PropertyName is not nameof(MainWindowViewModel.EnableSwitchToasts) &&
@@ -317,6 +319,7 @@ public partial class App : Application
         _settings.PinnedDeviceId = _viewModel.SelectedDeviceId;
         _settings.LaunchAtLogin = _viewModel.LaunchAtLogin;
         _settings.SwitchBitDepth = _viewModel.SwitchBitDepth;
+        _settings.RestartTrackAfterSampleRateChange = _viewModel.RestartTrackAfterSampleRateChange;
         _settings.PreferClosestSampleRateMultiple = _viewModel.PreferClosestSampleRateMultiple;
         _settings.DefaultBitDepth = _viewModel.DefaultBitDepth;
         _settings.EnableSwitchToasts = _viewModel.EnableSwitchToasts;
