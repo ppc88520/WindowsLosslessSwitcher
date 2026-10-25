@@ -4,12 +4,13 @@ using System.Diagnostics;
 using Windows.Media;
 using Windows.Media.Control;
 using Windows.Storage.Streams;
+using Windows.Foundation;
 using WindowsLosslessSwitcher.Abstractions;
 using WindowsLosslessSwitcher.Models;
 
 namespace WindowsLosslessSwitcher.Services;
 
-public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportController
+public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportController, IPreviousTrackRestarter, ITrackIdentityVerifier
 {
     // AUMID prefix shared by all Apple Music for Windows package identities.
     private const string AppleMusicAumidPrefix = "AppleInc.AppleMusicWin";
@@ -46,6 +47,9 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
     private readonly object _sessionStateSync = new();
     private GlobalSystemMediaTransportControlsSessionManager? _manager;
     private GlobalSystemMediaTransportControlsSession? _attachedSession;
+    private readonly SemaphoreSlim _sessionRefreshGate = new(1, 1);
+    private TypedEventHandler<GlobalSystemMediaTransportControlsSession, MediaPropertiesChangedEventArgs>? _mediaPropertiesHandler;
+    private TypedEventHandler<GlobalSystemMediaTransportControlsSession, PlaybackInfoChangedEventArgs>? _playbackInfoHandler;
     private string? _lastTrackKey;
     private CancellationTokenSource? _placeholderPublishCts;
     private CancellationTokenSource? _sessionLossCts;
@@ -54,6 +58,17 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
     private MediaArtworkSnapshot _artworkSnapshot = MediaArtworkSnapshot.CreateUnavailable();
     private MediaArtworkSnapshot? _lastAppliedRealArtwork;
     private long _snapshotGeneration;
+    private long _propertiesRefreshRevision;
+    private long _sessionEpoch;
+    private long _navigationRevision;
+    private readonly SemaphoreSlim _previousRestartGate = new(1, 1);
+    private readonly CancellationTokenSource _previousRestartLifetime = new();
+    private readonly object _previousGuardSync = new();
+    private bool _previousGuardActive;
+    private string? _previousGuardExpectedKey;
+    private string? _previousGuardUnexpectedKey;
+    private TrackSnapshot? _deferredTrack;
+    private volatile bool _disposed;
 
     public AppleMusicTrackSource(DiagnosticsLogger logger)
         : this(logger, PlaceholderDebounce, SessionLossDebounce)
@@ -88,7 +103,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
         _manager.SessionsChanged += OnSessionsChanged;
         _manager.CurrentSessionChanged += OnCurrentSessionChanged;
-        await RefreshAttachedSessionAsync();
+        await RefreshAttachedSessionAsync(cancellationToken: cancellationToken);
         _ = RepollWhileUnattachedAsync(_repollCts.Token);
         _logger.Info("Apple Music track source started.");
     }
@@ -120,15 +135,54 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
     public async ValueTask DisposeAsync()
     {
+        _disposed = true;
+        if (_manager is not null)
+        {
+            _manager.SessionsChanged -= OnSessionsChanged;
+            _manager.CurrentSessionChanged -= OnCurrentSessionChanged;
+        }
+        _previousRestartLifetime.Cancel();
+        await _previousRestartGate.WaitAsync();
+        _previousRestartGate.Release();
+        _previousRestartLifetime.Dispose();
         _repollCts.Cancel();
         _repollCts.Dispose();
         CancelSessionLossDebounce();
         CancelPlaceholderPublish();
         await DetachSessionAsync();
-        if (_manager is not null)
+    }
+
+    public async Task<bool> IsCurrentTrackAsync(TrackSnapshot expectedTrack, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (_disposed) return false;
+        // Re-enumeration is serialized and keeps the existing wrapper for the same native
+        // session. This also notices an idle session that Windows has actually replaced.
+        try
         {
-            _manager.SessionsChanged -= OnSessionsChanged;
-            _manager.CurrentSessionChanged -= OnCurrentSessionChanged;
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(3));
+            await RefreshAttachedSessionAsync(cancellationToken: deadline.Token);
+            var epoch = Volatile.Read(ref _sessionEpoch);
+            var session = _attachedSession;
+            if (session is null || !IsAttachedSession(session, epoch)) return false;
+            var properties = await ReadMediaPropertiesAsync(session, deadline.Token);
+            deadline.Token.ThrowIfCancellationRequested();
+            if (!IsAttachedSession(session, epoch) || !NativeSessionIdentity.AreSame(GetPreferredCommandSession(), session))
+            {
+                _logger.Warn($"Track verification rejected a changed session. epoch={epoch}, currentEpoch={Volatile.Read(ref _sessionEpoch)}.");
+                return false;
+            }
+            var actual = NormalizeSnapshot(BuildTrackSnapshot(session, properties, "fresh-track-verification"));
+            var matches = !IsPlaceholderTrack(actual) && !string.IsNullOrWhiteSpace(actual.Title) && actual.UniqueKey == expectedTrack.UniqueKey;
+            if (!matches) _logger.Warn($"Track verification mismatch: expected={expectedTrack.UniqueKey}, actual={actual.UniqueKey}, epoch={epoch}.");
+            return matches;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Fresh track verification failed: {ex.Message}, HRESULT=0x{ex.HResult:X8}.");
+            return false;
         }
     }
 
@@ -159,6 +213,23 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         }
     }
 
+    private static async Task<GlobalSystemMediaTransportControlsSessionMediaProperties> ReadMediaPropertiesAsync(
+        GlobalSystemMediaTransportControlsSession session, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        deadline.CancelAfter(TimeSpan.FromSeconds(3));
+        try
+        {
+            var properties = await session.TryGetMediaPropertiesAsync().AsTask(deadline.Token).WaitAsync(deadline.Token);
+            deadline.Token.ThrowIfCancellationRequested();
+            return properties;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+        { throw new TimeoutException("Apple Music media-properties read timed out; the current track could not be verified."); }
+    }
+
     public MediaSessionSnapshot GetSessionSnapshot()
     {
         lock (_sessionStateSync)
@@ -177,6 +248,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
     public async Task<bool> TryPauseAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _navigationRevision);
         var session = GetPreferredCommandSession();
         if (session is null)
         {
@@ -193,12 +265,13 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await session.TryPauseAsync();
+            return await BoundedMediaCommand.InvokeAsync(ct => session.TryPauseAsync().AsTask(ct), "Pause", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
+        catch (TimeoutException) { throw; }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to pause Apple Music playback: {ex.Message}");
@@ -208,6 +281,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
     public async Task<bool> TryPlayAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _navigationRevision);
         var session = GetPreferredCommandSession();
         if (session is null)
         {
@@ -224,12 +298,13 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await session.TryPlayAsync();
+            return await BoundedMediaCommand.InvokeAsync(ct => session.TryPlayAsync().AsTask(ct), "Play", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
+        catch (TimeoutException) { throw; }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to resume Apple Music playback: {ex.Message}");
@@ -239,6 +314,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
     public async Task<bool> TryTogglePlayPauseAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _navigationRevision);
         var session = GetPreferredCommandSession();
         if (session is null)
         {
@@ -255,12 +331,13 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await session.TryTogglePlayPauseAsync();
+            return await BoundedMediaCommand.InvokeAsync(ct => session.TryTogglePlayPauseAsync().AsTask(ct), "Toggle", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
+        catch (TimeoutException) { throw; }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to toggle Apple Music playback: {ex.Message}");
@@ -270,6 +347,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
     public async Task<bool> TryChangePlaybackPositionAsync(TimeSpan position, CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _navigationRevision);
         var session = GetPreferredCommandSession();
         if (session is null)
         {
@@ -286,12 +364,13 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await session.TryChangePlaybackPositionAsync(position.Ticks);
+            return await BoundedMediaCommand.InvokeAsync(ct => session.TryChangePlaybackPositionAsync(position.Ticks).AsTask(ct), "Seek", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
+        catch (TimeoutException) { throw; }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to change Apple Music playback position: {ex.Message}");
@@ -301,6 +380,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
     public async Task<bool> TrySkipNextAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _navigationRevision);
         var session = GetPreferredCommandSession();
         if (session is null)
         {
@@ -317,12 +397,13 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await session.TrySkipNextAsync();
+            return await BoundedMediaCommand.InvokeAsync(ct => session.TrySkipNextAsync().AsTask(ct), "Next", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
+        catch (TimeoutException) { throw; }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to skip Apple Music to the next track: {ex.Message}");
@@ -332,6 +413,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
     public async Task<bool> TrySkipPreviousAsync(CancellationToken cancellationToken)
     {
+        Interlocked.Increment(ref _navigationRevision);
         var session = GetPreferredCommandSession();
         if (session is null)
         {
@@ -348,15 +430,15 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            // Apple Music's skip-previous RESTARTS the current track when playback is far enough
-            // in (verified live: restart at 0:20 and 2:41); callers guard the position so this
-            // never jumps to the previous track.
-            return await session.TrySkipPreviousAsync();
+            // Previous semantics are player-defined and can navigate to another item. Automatic
+            // restart uses the separate guarded path; this method remains the ordinary UI control.
+            return await BoundedMediaCommand.InvokeAsync(ct => session.TrySkipPreviousAsync().AsTask(ct), "Previous", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
+        catch (TimeoutException) { throw; }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to restart the current Apple Music track: {ex.Message}");
@@ -364,76 +446,246 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         }
     }
 
+    public async Task<PreviousRestartResult> TryRestartWithPreviousAsync(
+        TrackSnapshot expectedTrack,
+        TrackSnapshot? precedingTrack,
+        CancellationToken cancellationToken)
+    {
+        if (_disposed)
+            return new(false, false, "Track source is disposed; Previous was not sent.");
+        await _previousRestartGate.WaitAsync(cancellationToken);
+        CapturedPreviousSession? captured = null;
+        PreviousRestartSnapshot? finalSnapshot = null;
+        long cleanupPublicationRevision = 0;
+        var result = new PreviousRestartResult(false, false, "Guard did not start.");
+        try
+        {
+            var session = _attachedSession;
+            if (session is null || _disposed)
+            {
+                result = new(false, false, "No attached Apple Music session; Previous was not sent.");
+            }
+            else
+            {
+                captured = new CapturedPreviousSession(this, session, Volatile.Read(ref _sessionEpoch), expectedTrack, precedingTrack);
+                lock (_previousGuardSync)
+                {
+                    Interlocked.Increment(ref _propertiesRefreshRevision);
+                    _previousGuardActive = true;
+                    _previousGuardExpectedKey = expectedTrack.UniqueKey;
+                    _previousGuardUnexpectedKey = null;
+                    _deferredTrack = null;
+                }
+
+                using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, _previousRestartLifetime.Token);
+                deadline.CancelAfter(TimeSpan.FromSeconds(12));
+                try
+                {
+                    var initial = await captured.ReadAsync(deadline.Token);
+                    if (initial is null && !captured.NavigationDispatched)
+                    {
+                        // An idle/replaced session may fail before any command. One fresh
+                        // attachment is safe here; never rebind a command already in flight.
+                        _logger.Warn("Previous-restart preflight: no navigation was dispatched; refreshing the session once before a fresh same-track paused check.");
+                        await RefreshAttachedSessionAsync(forceReattach: true, cancellationToken: deadline.Token);
+                        deadline.Token.ThrowIfCancellationRequested();
+                        var refreshedSession = _attachedSession;
+                        if (refreshedSession is not null)
+                        {
+                            captured = new CapturedPreviousSession(this, refreshedSession, Volatile.Read(ref _sessionEpoch), expectedTrack, precedingTrack);
+                            initial = await captured.ReadAsync(deadline.Token);
+                        }
+                    }
+
+                    if (initial is null || initial.Track.UniqueKey != expectedTrack.UniqueKey ||
+                        initial.PlaybackStatus != MediaTransportPlaybackStatus.Paused)
+                    {
+                        result = new(false, false, "Fresh preflight could not verify the same paused current track after at most one session refresh; no Previous was sent.");
+                        _logger.Warn(result.Detail);
+                    }
+                    else
+                    {
+                        result = await new GuardedPreviousRestart(captured, _logger)
+                            .TryRestartWithPreviousAsync(expectedTrack, precedingTrack, deadline.Token);
+                    }
+                }
+                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                {
+                    result = new(false, false, "Previous-restart reached its bounded deadline or the source stopped; automatic resume is unsafe.");
+                    _logger.Warn(result.Detail);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    result = new(false, false, "Previous-restart failed with an exception; automatic resume is unsafe.");
+                    _logger.Error($"{result.Detail} HRESULT=0x{ex.HResult:X8}.", ex);
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                // In-flight read operations may be canceled safely. Remote navigation commands
+                // cannot be undone; the coordinator holds mute on an unsafe/canceled result.
+                if (captured is not null && !_disposed)
+                {
+                    using var cleanupDeadline = new CancellationTokenSource(TimeSpan.FromSeconds(1));
+                    try { finalSnapshot = await captured.ReadFinalAsync(cleanupDeadline.Token); }
+                    catch (Exception ex) { _logger.Warn($"Previous-restart final metadata unavailable: {ex.Message}"); }
+                }
+
+                lock (_previousGuardSync)
+                {
+                    cleanupPublicationRevision = Interlocked.Increment(ref _propertiesRefreshRevision);
+                    _previousGuardActive = false;
+                    _previousGuardExpectedKey = null;
+                    _previousGuardUnexpectedKey = null;
+                    if (_deferredTrack is not null)
+                        _logger.Info("Previous-restart: discarded transient callbacks; only a freshly read final item may be published.");
+                    _deferredTrack = null;
+                }
+
+                var finalMatches = finalSnapshot is not null && finalSnapshot.Track.UniqueKey == expectedTrack.UniqueKey &&
+                    finalSnapshot.NavigationRevision == captured?.CapturedNavigationRevision;
+                if (result.SafeToResume && !finalMatches)
+                    result = new(false, false, "Fresh final metadata did not match the original track; automatic resume is unsafe.");
+                if (result.Restarted && finalSnapshot is { } final &&
+                    (final.PlaybackStatus != MediaTransportPlaybackStatus.Paused || final.Position is null ||
+                     final.Position < TimeSpan.Zero || final.Position > GuardedPreviousRestart.PositionTolerance))
+                    result = new(false, finalMatches, "Track was rechecked, but paused 0:00 no longer held before releasing the guard.");
+
+                if (finalSnapshot is not null && captured?.LastPlaybackInfo is { } playbackInfo && !_disposed)
+                {
+                    var artwork = IsSameTrack(GetSessionSnapshot(), finalSnapshot.Track)
+                        ? GetArtworkSnapshot() : MediaArtworkSnapshot.CreateUnavailable();
+                    lock (_previousGuardSync)
+                    {
+                        if (cleanupPublicationRevision == Volatile.Read(ref _propertiesRefreshRevision))
+                            UpdateSessionState(BuildSessionSnapshot(captured.Session, finalSnapshot.Track, playbackInfo, artwork), artwork);
+                    }
+                    PublishSnapshot(finalSnapshot.Track, "previous-restart-final", cleanupPublicationRevision);
+                }
+                else
+                {
+                    _logger.Warn("Previous-restart: no fresh final item was published; waiting for the next real metadata callback.");
+                }
+            }
+            finally
+            {
+                _previousRestartGate.Release();
+            }
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        if (result.SafeToResume && cleanupPublicationRevision != Volatile.Read(ref _propertiesRefreshRevision))
+        {
+            _logger.Warn("Previous-restart: a newer properties callback started after the final read; automatic resume is unsafe.");
+            result = new(false, false, "Media properties changed after the final identity check; automatic resume is unsafe.");
+        }
+        _logger.Info($"Previous-restart transport result: Restarted={result.Restarted}, SafeToResume={result.SafeToResume}; {result.Detail}");
+        return result;
+    }
+
     private async void OnCurrentSessionChanged(GlobalSystemMediaTransportControlsSessionManager sender, CurrentSessionChangedEventArgs args)
     {
-        await RefreshAttachedSessionAsync();
+        await RefreshAttachedSessionFromEventAsync();
     }
 
     private async void OnSessionsChanged(GlobalSystemMediaTransportControlsSessionManager sender, SessionsChangedEventArgs args)
     {
-        await RefreshAttachedSessionAsync();
+        await RefreshAttachedSessionFromEventAsync();
     }
 
-    private async Task RefreshAttachedSessionAsync()
+    private async Task RefreshAttachedSessionFromEventAsync()
     {
-        if (_manager is null)
-        {
-            return;
-        }
-
-        var sessions = _manager.GetSessions().ToList();
-        _logger.Info(
-            $"GSMTC sessions visible: {sessions.Count}. " +
-            $"{string.Join(", ", sessions.Select(session => session.SourceAppUserModelId))}");
-
-        var candidate = SelectPreferredSession(sessions, _manager.GetCurrentSession(), _attachedSession);
-
-        if (candidate is not null)
-        {
-            CancelSessionLossDebounce();
-        }
-
-        if (ReferenceEquals(candidate, _attachedSession))
-        {
-            return;
-        }
-
-        if (candidate is null)
-        {
-            BeginSessionLossDebounce();
-            return;
-        }
-
-        await DetachSessionAsync();
-        _attachedSession = candidate;
-        _logger.Info($"Attaching Apple Music session {candidate.SourceAppUserModelId}. lastTrack={_lastTrackKey ?? "none"}.");
-        _attachedSession.MediaPropertiesChanged += OnMediaPropertiesChanged;
-        _attachedSession.PlaybackInfoChanged += OnPlaybackInfoChanged;
-        await RefreshSessionFromPropertiesAsync(_attachedSession, "session-attached", publishTrackSnapshot: true);
+        try { await RefreshAttachedSessionAsync(); }
+        catch (Exception ex) { _logger.Warn($"Apple Music session refresh event failed: {ex.Message}"); }
     }
 
-    private Task DetachSessionAsync()
+    private async Task RefreshAttachedSessionAsync(bool forceReattach = false, CancellationToken cancellationToken = default)
     {
-        if (_attachedSession is not null)
+        await _sessionRefreshGate.WaitAsync(cancellationToken);
+        try
         {
-            _logger.Info($"Detaching Apple Music session {_attachedSession.SourceAppUserModelId}. lastTrack={_lastTrackKey ?? "none"}.");
-            _attachedSession.MediaPropertiesChanged -= OnMediaPropertiesChanged;
-            _attachedSession.PlaybackInfoChanged -= OnPlaybackInfoChanged;
-        }
+            if (_manager is null || _disposed) return;
 
+            var sessions = _manager.GetSessions().ToList();
+            _logger.Info(
+                $"GSMTC sessions visible: {sessions.Count}. " +
+                $"{string.Join(", ", sessions.Select(session => session.SourceAppUserModelId))}");
+
+            var candidate = SelectPreferredSession(sessions, _manager.GetCurrentSession(), _attachedSession);
+
+            if (candidate is not null) CancelSessionLossDebounce();
+
+            if (!forceReattach && NativeSessionIdentity.AreSame(candidate, _attachedSession)) return;
+
+            if (candidate is null)
+            {
+                BeginSessionLossDebounce();
+                return;
+            }
+
+            DetachSessionCore();
+            _attachedSession = candidate;
+            var epoch = Interlocked.Increment(ref _sessionEpoch);
+            _logger.Info($"Attaching Apple Music session {candidate.SourceAppUserModelId}. native=0x{NativeSessionIdentity.GetIdentity(candidate):X}, epoch={epoch}, forced={forceReattach}, lastTrack={_lastTrackKey ?? "none"}.");
+            // Every subscription captures its epoch. A queued old callback cannot acquire
+            // the new epoch merely because the application id or native object is reused.
+            _mediaPropertiesHandler = (sender, args) => OnMediaPropertiesChanged(sender, args, epoch);
+            _playbackInfoHandler = (sender, args) => OnPlaybackInfoChanged(sender, args, epoch);
+            candidate.MediaPropertiesChanged += _mediaPropertiesHandler;
+            candidate.PlaybackInfoChanged += _playbackInfoHandler;
+            // A hung media-properties request must not hold the attachment gate forever.
+            using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            deadline.CancelAfter(TimeSpan.FromSeconds(2));
+            try { await RefreshSessionFromPropertiesAsync(candidate, "session-attached", publishTrackSnapshot: true, epoch, deadline.Token); }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            { _logger.Warn("Initial Apple Music metadata timed out; retaining the attachment for the next event."); }
+        }
+        finally { _sessionRefreshGate.Release(); }
+    }
+
+    private async Task DetachSessionAsync()
+    {
+        await _sessionRefreshGate.WaitAsync();
+        try { DetachSessionCore(); }
+        finally { _sessionRefreshGate.Release(); }
+    }
+
+    private void DetachSessionCore()
+    {
+        // Capture every old subscription before clearing global state. This method runs
+        // only under the refresh gate; detach can never unsubscribe a successor's object.
+        var previous = _attachedSession;
+        var propertiesHandler = _mediaPropertiesHandler;
+        var playbackHandler = _playbackInfoHandler;
         _attachedSession = null;
+        _mediaPropertiesHandler = null;
+        _playbackInfoHandler = null;
+        Interlocked.Increment(ref _sessionEpoch);
+        Interlocked.Increment(ref _propertiesRefreshRevision);
+        if (previous is not null)
+        {
+            _logger.Info($"Detaching Apple Music session {previous.SourceAppUserModelId}. native=0x{NativeSessionIdentity.GetIdentity(previous):X}, lastTrack={_lastTrackKey ?? "none"}.");
+            if (propertiesHandler is not null) previous.MediaPropertiesChanged -= propertiesHandler;
+            if (playbackHandler is not null) previous.PlaybackInfoChanged -= playbackHandler;
+        }
         UpdateSessionState(MediaSessionSnapshot.CreateUnavailable(), MediaArtworkSnapshot.CreateUnavailable());
-        return Task.CompletedTask;
     }
 
-    private async void OnMediaPropertiesChanged(GlobalSystemMediaTransportControlsSession sender, MediaPropertiesChangedEventArgs args)
+    private bool IsAttachedSession(GlobalSystemMediaTransportControlsSession session, long epoch) =>
+        !_disposed && epoch == Volatile.Read(ref _sessionEpoch) && NativeSessionIdentity.AreSame(_attachedSession, session);
+
+    private async void OnMediaPropertiesChanged(GlobalSystemMediaTransportControlsSession sender, MediaPropertiesChangedEventArgs args, long epoch)
     {
+        if (!IsAttachedSession(sender, epoch)) { _logger.Verbose("Discarding obsolete Apple Music properties event."); return; }
         _logger.Info($"Apple Music media-properties callback received from {sender.SourceAppUserModelId}.");
-        await RefreshSessionFromPropertiesAsync(sender, "media-properties", publishTrackSnapshot: true);
+        await RefreshSessionFromPropertiesAsync(sender, "media-properties", publishTrackSnapshot: true, epoch);
     }
 
-    private async void OnPlaybackInfoChanged(GlobalSystemMediaTransportControlsSession sender, PlaybackInfoChangedEventArgs args)
+    private async void OnPlaybackInfoChanged(GlobalSystemMediaTransportControlsSession sender, PlaybackInfoChangedEventArgs args, long epoch)
     {
+        if (!IsAttachedSession(sender, epoch)) { _logger.Verbose("Discarding obsolete Apple Music playback event."); return; }
         GlobalSystemMediaTransportControlsSessionPlaybackStatus status;
         try
         {
@@ -441,34 +693,45 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         }
         catch
         {
-            UpdateSessionFromPlaybackInfo(sender);
+            if (IsAttachedSession(sender, epoch)) UpdateSessionFromPlaybackInfo(sender);
             return;
         }
 
         if (status == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
         {
             _logger.Info($"Apple Music playback-playing callback received from {sender.SourceAppUserModelId}.");
-            await RefreshSessionFromPropertiesAsync(sender, "playback-playing", publishTrackSnapshot: true);
+            await RefreshSessionFromPropertiesAsync(sender, "playback-playing", publishTrackSnapshot: true, epoch);
             return;
         }
 
-        UpdateSessionFromPlaybackInfo(sender);
+        if (IsAttachedSession(sender, epoch)) UpdateSessionFromPlaybackInfo(sender);
     }
 
     private async Task RefreshSessionFromPropertiesAsync(
         GlobalSystemMediaTransportControlsSession session,
         string reason,
-        bool publishTrackSnapshot)
+        bool publishTrackSnapshot,
+        long epoch,
+        CancellationToken cancellationToken = default)
     {
+        if (!IsAttachedSession(session, epoch)) return;
+        var propertiesRevision = Interlocked.Increment(ref _propertiesRefreshRevision);
         var callbackStopwatch = Stopwatch.StartNew();
         GlobalSystemMediaTransportControlsSessionMediaProperties properties;
         try
         {
-            properties = await session.TryGetMediaPropertiesAsync();
+            properties = await ReadMediaPropertiesAsync(session, cancellationToken);
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
         catch (Exception ex)
         {
             _logger.Warn($"Failed to read Apple Music media properties ({reason}): {ex.Message}");
+            return;
+        }
+
+        if (propertiesRevision != Volatile.Read(ref _propertiesRefreshRevision) || !IsAttachedSession(session, epoch))
+        {
+            _logger.Verbose($"Discarding superseded Apple Music properties callback ({reason}).");
             return;
         }
 
@@ -482,11 +745,12 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         }
         catch
         {
-            UpdateSessionFromPlaybackInfo(session);
+            if (IsAttachedSession(session, epoch)) UpdateSessionFromPlaybackInfo(session);
             return;
         }
 
         var sessionSnapshot = BuildSessionSnapshot(session, snapshot, playbackInfo, MediaArtworkSnapshot.CreateUnavailable());
+        if (!IsAttachedSession(session, epoch)) return;
         _ = ProcessResolvedSnapshotAsync(
             snapshot,
             sessionSnapshot,
@@ -495,7 +759,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
             reason,
             callbackStopwatch.ElapsedMilliseconds,
             CancellationToken.None,
-            cancellation => ReadArtworkFreshAsync(session, cancellation));
+            cancellation => ReadArtworkFreshAsync(session, cancellation),
+            propertiesRevision);
     }
 
     // GSMTC's thumbnail often lags a track change: the media-properties callback for the NEW
@@ -514,17 +779,25 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         string reason,
         long callbackLatencyMs,
         CancellationToken cancellationToken,
-        Func<CancellationToken, Task<MediaArtworkSnapshot>>? artworkRetryLoader = null)
+        Func<CancellationToken, Task<MediaArtworkSnapshot>>? artworkRetryLoader = null,
+        long? propertiesRevision = null)
     {
+        if (propertiesRevision is { } revision && revision != Volatile.Read(ref _propertiesRefreshRevision))
+            return;
         if (publishTrackSnapshot)
         {
             _logger.Info(
                 $"Publishing Apple Music track snapshot after {callbackLatencyMs} ms ({reason}).",
                 new DiagnosticsLogger.LogCorrelation(TrackKey: snapshot.UniqueKey));
-            HandleSnapshot(snapshot, isNormalized: true);
+            HandleSnapshot(snapshot, isNormalized: true, propertiesRevision);
         }
 
-        UpdateSessionState(sessionSnapshot, MediaArtworkSnapshot.CreateUnavailable());
+        lock (_previousGuardSync)
+        {
+            if (_previousGuardActive || (propertiesRevision is { } currentRevision && currentRevision != Volatile.Read(ref _propertiesRefreshRevision)))
+                return;
+            UpdateSessionState(sessionSnapshot, MediaArtworkSnapshot.CreateUnavailable());
+        }
 
         try
         {
@@ -537,6 +810,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 artworkSnapshot = await artworkRetryLoader(cancellationToken);
             }
 
+            if (_disposed || (propertiesRevision is { } artworkRevision && artworkRevision != Volatile.Read(ref _propertiesRefreshRevision)))
+                return;
             ApplyArtworkSnapshotIfCurrent(snapshot, sessionSnapshot, artworkSnapshot, reason);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -565,7 +840,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
     {
         try
         {
-            var properties = await session.TryGetMediaPropertiesAsync().AsTask(cancellationToken);
+            var properties = await ReadMediaPropertiesAsync(session, cancellationToken);
             return properties is null
                 ? MediaArtworkSnapshot.CreateUnavailable()
                 : await ReadArtworkSnapshotAsync(properties, cancellationToken);
@@ -592,7 +867,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         return IsPlaceholderValue(snapshot.Title) || IsPlaceholderValue(snapshot.Artist);
     }
 
-    private void HandleSnapshot(TrackSnapshot snapshot, bool isNormalized)
+    private void HandleSnapshot(TrackSnapshot snapshot, bool isNormalized, long? propertiesRevision = null)
     {
         if (!isNormalized)
         {
@@ -621,12 +896,13 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         }
 
         CancelPlaceholderPublish();
-        _lastRealTrack = snapshot;
-        PublishSnapshot(snapshot, snapshot.DetectionReason);
+        PublishSnapshot(snapshot, snapshot.DetectionReason, propertiesRevision);
     }
 
     private void UpdateSessionFromPlaybackInfo(GlobalSystemMediaTransportControlsSession session)
     {
+        var epoch = Volatile.Read(ref _sessionEpoch);
+        if (!IsAttachedSession(session, epoch)) return;
         try
         {
             var playbackInfo = session.GetPlaybackInfo();
@@ -650,7 +926,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 ObservedAtUtc = DateTimeOffset.UtcNow,
             };
 
-            UpdateSessionState(updatedSnapshot, GetArtworkSnapshot());
+            if (IsAttachedSession(session, epoch)) UpdateSessionState(updatedSnapshot, GetArtworkSnapshot());
         }
         catch
         {
@@ -762,22 +1038,22 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         try
         {
             await Task.Delay(_sessionLossDebounce, cts.Token);
-            if (_manager is null)
+            var refresh = false;
+            await _sessionRefreshGate.WaitAsync(cts.Token);
+            try
             {
-                return;
+                if (_manager is null || _disposed) return;
+                var candidate = _manager.GetSessions()
+                    .FirstOrDefault(session => IsAppleMusicSessionId(session.SourceAppUserModelId));
+                if (candidate is not null) refresh = true;
+                else
+                {
+                    DetachSessionCore();
+                    _logger.Warn("Apple Music session was not found after debounce.");
+                }
             }
-
-            var candidate = _manager.GetSessions()
-                .FirstOrDefault(session => IsAppleMusicSessionId(session.SourceAppUserModelId));
-
-            if (candidate is not null)
-            {
-                await RefreshAttachedSessionAsync();
-                return;
-            }
-
-            await DetachSessionAsync();
-            _logger.Warn("Apple Music session was not found after debounce.");
+            finally { _sessionRefreshGate.Release(); }
+            if (refresh) await RefreshAttachedSessionAsync(cancellationToken: cts.Token);
         }
         catch (OperationCanceledException)
         {
@@ -803,15 +1079,34 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         _placeholderPublishCts?.Cancel();
     }
 
-    private void PublishSnapshot(TrackSnapshot snapshot, string reason)
+    private void PublishSnapshot(TrackSnapshot snapshot, string reason, long? propertiesRevision = null)
     {
-        if (snapshot.UniqueKey == _lastTrackKey)
+        lock (_previousGuardSync)
         {
-            _logger.Info($"Suppressing duplicate Apple Music snapshot publish ({reason}).", CreateSnapshotCorrelation(Volatile.Read(ref _snapshotGeneration), snapshot));
-            return;
+            if (propertiesRevision is { } revision && revision != Volatile.Read(ref _propertiesRefreshRevision))
+                return;
+            if (_previousGuardActive)
+            {
+                _deferredTrack = snapshot;
+                if (snapshot.UniqueKey != _previousGuardExpectedKey)
+                {
+                    if (_previousGuardUnexpectedKey is not null && _previousGuardUnexpectedKey != snapshot.UniqueKey)
+                        Interlocked.Increment(ref _navigationRevision);
+                    _previousGuardUnexpectedKey = snapshot.UniqueKey;
+                }
+                _logger.Info($"Previous-restart: deferred track notification while verifying the guarded command ({reason}).");
+                return;
+            }
+            if (!IsPlaceholderTrack(snapshot))
+                _lastRealTrack = snapshot;
+            if (snapshot.UniqueKey == _lastTrackKey)
+            {
+                _logger.Info($"Suppressing duplicate Apple Music snapshot publish ({reason}).", CreateSnapshotCorrelation(Volatile.Read(ref _snapshotGeneration), snapshot));
+                return;
+            }
+            _lastTrackKey = snapshot.UniqueKey;
         }
 
-        _lastTrackKey = snapshot.UniqueKey;
         _logger.Info($"Track changed: {snapshot.Title} - {snapshot.Artist} ({reason}).", CreateSnapshotCorrelation(Volatile.Read(ref _snapshotGeneration), snapshot));
         TrackChanged?.Invoke(this, snapshot);
     }
@@ -955,6 +1250,177 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
     private static DiagnosticsLogger.LogCorrelation CreateSnapshotCorrelation(long snapshotGeneration, TrackSnapshot snapshot) =>
         new(TrackKey: snapshot.UniqueKey, SnapshotGeneration: snapshotGeneration);
 
+    private sealed class CapturedPreviousSession : IPreviousRestartSession
+    {
+        private readonly AppleMusicTrackSource _owner;
+        private readonly long _epoch;
+        private readonly string _identity;
+        private readonly TrackSnapshot _expectedTrack;
+        private readonly TrackSnapshot? _precedingTrack;
+        private PreviousRestartSnapshot? _beforePrevious;
+        private string? _lastReadRefusal;
+
+        public CapturedPreviousSession(
+            AppleMusicTrackSource owner,
+            GlobalSystemMediaTransportControlsSession session,
+            long epoch,
+            TrackSnapshot expectedTrack,
+            TrackSnapshot? precedingTrack)
+        {
+            _owner = owner;
+            Session = session;
+            _epoch = epoch;
+            _identity = $"{session.SourceAppUserModelId}#{epoch}:0x{NativeSessionIdentity.GetIdentity(session):X}";
+            _expectedTrack = expectedTrack;
+            _precedingTrack = precedingTrack;
+            CapturedNavigationRevision = Volatile.Read(ref owner._navigationRevision);
+        }
+
+        public GlobalSystemMediaTransportControlsSession Session { get; }
+        public long CapturedNavigationRevision { get; }
+        public bool NavigationDispatched { get; private set; }
+        public GlobalSystemMediaTransportControlsSessionPlaybackInfo? LastPlaybackInfo { get; private set; }
+
+        public Task<PreviousRestartSnapshot?> ReadAsync(CancellationToken cancellationToken) =>
+            ReadCoreAsync(ignoreNavigationRevision: false, cancellationToken);
+
+        public Task<PreviousRestartSnapshot?> ReadFinalAsync(CancellationToken cancellationToken) =>
+            ReadCoreAsync(ignoreNavigationRevision: true, cancellationToken);
+
+        private async Task<PreviousRestartSnapshot?> ReadCoreAsync(bool ignoreNavigationRevision, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!CanRead(ignoreNavigationRevision, "before metadata")) return null;
+            var properties = await ReadMediaPropertiesAsync(Session, cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!CanRead(ignoreNavigationRevision, "after metadata")) return null;
+            var track = _owner.NormalizeSnapshot(BuildTrackSnapshot(Session, properties, "previous-restart-read"));
+            if (string.IsNullOrWhiteSpace(track.Title) || IsPlaceholderTrack(track))
+            {
+                RefuseRead($"empty/placeholder metadata: title={track.Title}, artist={track.Artist}");
+                return null;
+            }
+            var info = Session.GetPlaybackInfo();
+            var timeline = Session.GetTimelineProperties();
+            var controls = info.Controls;
+            LastPlaybackInfo = info;
+            return new(
+                _identity,
+                track,
+                MapPlaybackStatus(info.PlaybackStatus),
+                timeline.Position,
+                controls?.IsPreviousEnabled == true,
+                controls?.IsNextEnabled == true,
+                controls?.IsPauseEnabled == true,
+                info.IsShuffleActive,
+                MapRepeatMode(info.AutoRepeatMode ?? MediaPlaybackAutoRepeatMode.None),
+                Volatile.Read(ref _owner._navigationRevision));
+        }
+
+        public async Task<bool> PreviousAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fresh = await ReadAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (fresh is null || fresh.Track.UniqueKey != _expectedTrack.UniqueKey ||
+                fresh.PlaybackStatus != MediaTransportPlaybackStatus.Paused ||
+                fresh.Position is null || fresh.Position < GuardedPreviousRestart.MinimumPosition || !fresh.CanPrevious)
+            {
+                _owner._logger.Warn("Previous-restart dispatch blocked: fresh captured-session metadata, pause, position or Previous capability no longer matched.");
+                return false;
+            }
+            _beforePrevious = fresh;
+            // This narrows the read/dispatch gap; GSMTC still cannot atomically bind a navigation
+            // command to a media-item identity, so post-command verification remains essential.
+            if (!IsCapturedSession() || NavigationChanged())
+                return false;
+            NavigationDispatched = true; // Set before awaiting: a timed-out remote command may still execute.
+            var accepted = await BoundedMediaCommand.InvokeAsync(ct => Session.TrySkipPreviousAsync().AsTask(ct), "guarded Previous", cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            _owner._logger.Info($"Previous-restart actual Previous API returned {accepted} on {_identity}.");
+            return accepted;
+        }
+
+        public async Task<bool> NextAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fresh = await ReadAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (_precedingTrack is null || _beforePrevious is null || fresh is null ||
+                _precedingTrack.UniqueKey == _expectedTrack.UniqueKey || fresh.Track.UniqueKey != _precedingTrack.UniqueKey ||
+                fresh.PlaybackStatus != MediaTransportPlaybackStatus.Paused || !fresh.CanNext ||
+                _beforePrevious.IsShuffleActive != false || fresh.IsShuffleActive != false ||
+                _beforePrevious.RepeatMode is not (MediaTransportRepeatMode.Off or MediaTransportRepeatMode.All) ||
+                fresh.RepeatMode is not (MediaTransportRepeatMode.Off or MediaTransportRepeatMode.All))
+            {
+                _owner._logger.Warn("Previous-restart correction blocked: fresh captured-session predecessor, pause or queue mode no longer matched.");
+                return false;
+            }
+            if (!IsCapturedSession() || NavigationChanged())
+                return false;
+            NavigationDispatched = true;
+            var accepted = await BoundedMediaCommand.InvokeAsync(ct => Session.TrySkipNextAsync().AsTask(ct), "guarded Next", cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            _owner._logger.Info($"Previous-restart actual correcting Next API returned {accepted} on {_identity}.");
+            return accepted;
+        }
+
+        public async Task<bool> PauseAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (!IsCapturedSession() || NavigationChanged() || Session.GetPlaybackInfo().Controls?.IsPauseEnabled != true)
+                return false;
+            var accepted = await BoundedMediaCommand.InvokeAsync(ct => Session.TryPauseAsync().AsTask(ct), "guarded Pause", cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            _owner._logger.Info($"Previous-restart captured-session Pause API returned {accepted} on {_identity}.");
+            return accepted;
+        }
+
+        public async Task<bool> PlayAsync(CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            var fresh = await ReadAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (fresh is null || fresh.Track.UniqueKey != _expectedTrack.UniqueKey ||
+                fresh.PlaybackStatus != MediaTransportPlaybackStatus.Paused || !IsCapturedSession() || NavigationChanged() ||
+                Session.GetPlaybackInfo().Controls?.IsPlayEnabled != true)
+            {
+                _owner._logger.Warn("Previous-restart activation Play blocked: current captured-session item, pause or Play capability changed.");
+                return false;
+            }
+            var accepted = await BoundedMediaCommand.InvokeAsync(ct => Session.TryPlayAsync().AsTask(ct), "guarded activation Play", cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            _owner._logger.Info($"Previous-restart captured-session activation Play API returned {accepted} on {_identity}; endpoint must remain muted.");
+            return accepted;
+        }
+
+        private bool NavigationChanged() => Volatile.Read(ref _owner._navigationRevision) != CapturedNavigationRevision;
+
+        private bool CanRead(bool ignoreNavigationRevision, string stage)
+        {
+            var reason = _owner._disposed ? "source disposed" :
+                Volatile.Read(ref _owner._sessionEpoch) != _epoch ? "attached epoch changed" :
+                !NativeSessionIdentity.AreSame(_owner._attachedSession, Session) ? "attached native identity changed" :
+                !NativeSessionIdentity.AreSame(_owner.GetPreferredCommandSession(), Session) ? "preferred native identity changed or unavailable" :
+                !ignoreNavigationRevision && NavigationChanged() ? "navigation revision changed" : null;
+            if (reason is null) return true;
+            RefuseRead($"{stage}: {reason}");
+            return false;
+        }
+
+        private void RefuseRead(string reason)
+        {
+            if (_lastReadRefusal == reason) return;
+            _lastReadRefusal = reason;
+            _owner._logger.Warn($"Previous-restart fresh read refused ({reason}); captured={_identity}, " +
+                $"epoch={_epoch}/{Volatile.Read(ref _owner._sessionEpoch)}, navigation={CapturedNavigationRevision}/{Volatile.Read(ref _owner._navigationRevision)}, " +
+                $"attached=0x{(_owner._attachedSession is { } attached ? NativeSessionIdentity.GetIdentity(attached) : 0):X}, " +
+                $"preferred=0x{(_owner.GetPreferredCommandSession() is { } preferred ? NativeSessionIdentity.GetIdentity(preferred) : 0):X}.");
+        }
+
+        private bool IsCapturedSession() => CanRead(ignoreNavigationRevision: true, "command identity");
+    }
+
     internal GlobalSystemMediaTransportControlsSession? GetPreferredCommandSession()
     {
         var manager = _manager;
@@ -965,11 +1431,11 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
         try
         {
-            return SelectPreferredSession(manager.GetSessions(), manager.GetCurrentSession(), _attachedSession) ?? _attachedSession;
+            return SelectPreferredSession(manager.GetSessions(), manager.GetCurrentSession(), _attachedSession);
         }
         catch
         {
-            return _attachedSession;
+            return null; // Failed census cannot prove that the cached idle session is still present.
         }
     }
 
@@ -992,7 +1458,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
             {
                 if (session.GetPlaybackInfo().PlaybackStatus == GlobalSystemMediaTransportControlsSessionPlaybackStatus.Playing)
                 {
-                    return session;
+                    return NativeSessionIdentity.AreSame(session, attachedSession) ? attachedSession : session;
                 }
             }
             catch
@@ -1003,16 +1469,15 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         if (currentSession is not null &&
             IsAppleMusicSessionId(currentSession.SourceAppUserModelId))
         {
-            return appleMusicSessions.FirstOrDefault(session => ReferenceEquals(session, currentSession)) ??
-                   appleMusicSessions.FirstOrDefault(session => session.SourceAppUserModelId == currentSession.SourceAppUserModelId) ??
-                   currentSession;
+            var current = appleMusicSessions.FirstOrDefault(session => NativeSessionIdentity.AreSame(session, currentSession));
+            if (current is not null)
+                return NativeSessionIdentity.AreSame(current, attachedSession) ? attachedSession : current;
         }
 
         if (attachedSession is not null)
         {
-            return appleMusicSessions.FirstOrDefault(session => ReferenceEquals(session, attachedSession)) ??
-                   appleMusicSessions.FirstOrDefault(session => session.SourceAppUserModelId == attachedSession.SourceAppUserModelId) ??
-                   attachedSession;
+            var attached = appleMusicSessions.FirstOrDefault(session => NativeSessionIdentity.AreSame(session, attachedSession));
+            if (attached is not null) return attachedSession;
         }
 
         return appleMusicSessions[0];
