@@ -46,6 +46,11 @@ public sealed class TrayIconHost : IDisposable
         _notifyIcon.Text = statusText.Length > 63 ? statusText[..63] : statusText;
     }
 
+    public void ShowRecoveryNotification(string title, string message)
+    {
+        _notifyIcon.ShowBalloonTip(6000, title, message, ToolTipIcon.Warning);
+    }
+
     public void Dispose()
     {
         _notifyIcon.Visible = false;

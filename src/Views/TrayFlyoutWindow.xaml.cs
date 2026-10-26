@@ -19,6 +19,7 @@ public partial class TrayFlyoutWindow : Window
     {
         InitializeComponent();
         DataContext = viewModel;
+        MaxHeight = Math.Max(400, SystemParameters.WorkArea.Height - 32);
         Deactivated += (_, _) => Hide();
         PreviewKeyDown += (_, args) =>
         {

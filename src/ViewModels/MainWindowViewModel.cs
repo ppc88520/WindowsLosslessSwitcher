@@ -70,8 +70,43 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     private string? _detectedStorefront;
     private string? _lastActivityText;
 
+    private bool _isRestartBusy;
+    private bool _hasRecoveryAdvice;
+    private string _recoveryTitle = "";
+    private string _recoveryMessage = "";
+
+    public bool IsRestartBusy
+    {
+        get => _isRestartBusy;
+        set
+        {
+            if (!SetField(ref _isRestartBusy, value)) return;
+            RestartToolCommand.RaiseCanExecuteChanged();
+            RestartPlayerAndToolCommand.RaiseCanExecuteChanged();
+        }
+    }
+    public bool HasRecoveryAdvice { get => _hasRecoveryAdvice; private set => SetField(ref _hasRecoveryAdvice, value); }
+    public string RecoveryTitle { get => _recoveryTitle; private set => SetField(ref _recoveryTitle, value); }
+    public string RecoveryMessage { get => _recoveryMessage; private set => SetField(ref _recoveryMessage, value); }
+    public RelayCommand RestartToolCommand { get; }
+    public RelayCommand RestartPlayerAndToolCommand { get; }
+    public event Action? RestartToolRequested;
+    public event Action? RestartPlayerAndToolRequested;
+
+    public void SetLifecycleNotice(string title, string message)
+    {
+        RecoveryTitle = title;
+        RecoveryMessage = message;
+        HasRecoveryAdvice = true;
+        Phase = SwitchPhase.Failed;
+        PhaseText = title;
+        IsBusyPhase = false;
+    }
+
     public MainWindowViewModel()
     {
+        RestartToolCommand = new RelayCommand(() => RestartToolRequested?.Invoke(), () => !IsRestartBusy);
+        RestartPlayerAndToolCommand = new RelayCommand(() => RestartPlayerAndToolRequested?.Invoke(), () => !IsRestartBusy);
         RefreshDevicesCommand = new RelayCommand(() => RefreshRequested?.Invoke());
         ExportDiagnosticsCommand = new RelayCommand(() => ExportDiagnosticsRequested?.Invoke());
         RestoreOriginalFormatCommand = new RelayCommand(
@@ -580,6 +615,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             ? "-"
             : AudioFormatTextFormatter.Format(status.AppliedFormat);
         FailureReasonText = string.IsNullOrWhiteSpace(status.FailureReason) ? "-" : status.FailureReason;
+        var advice = Services.RecoveryAdvice.From(status);
+        RecoveryTitle = advice.Title;
+        RecoveryMessage = advice.Message;
+        HasRecoveryAdvice = advice.Category != RecoveryCategory.None;
 
         TrackTitleText = status.Track?.Title is { Length: > 0 } title ? title : "Nothing playing";
         TrackMetaText = BuildTrackMetaText(status.Track);
@@ -633,6 +672,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     /// </summary>
     internal static SwitchPhase DerivePhase(Services.SwitchingStatus status)
     {
+        var advice = Services.RecoveryAdvice.From(status);
+        if (advice.IsFailure) return SwitchPhase.Failed;
+        if (advice.Category == RecoveryCategory.WaitingForPlayback) return SwitchPhase.Idle;
         var text = status.ResolverStatusText;
         if (text.StartsWith("Switching: Playback restored", StringComparison.Ordinal))
         {
@@ -658,7 +700,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         };
     }
 
-    internal static string BuildPhaseText(SwitchPhase phase, Services.SwitchingStatus status) => phase switch
+    internal static string BuildPhaseText(SwitchPhase phase, Services.SwitchingStatus status) =>
+        Services.RecoveryAdvice.From(status) is { Category: not RecoveryCategory.None } advice
+            ? advice.Title
+            : phase switch
     {
         SwitchPhase.Idle => "Watching Apple Music media session",
         SwitchPhase.Detecting => "Track change — output muted",

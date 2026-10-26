@@ -14,8 +14,13 @@ public static class Program
     /// Application entry point.
     /// </summary>
     [STAThread]
-    public static void Main()
+    public static void Main(string[] args)
     {
+        if (args.Length == 2 && args[0] == ManualRestartHandoff.HelperArgument)
+        {
+            ManualRestartHandoff.RunHelperAsync(args[1]).GetAwaiter().GetResult();
+            return;
+        }
         VelopackApp.Build().Run();
 
         // Must run before App is constructed: its field initializers create the logger, which

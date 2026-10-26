@@ -72,6 +72,8 @@ With the experimental restart option off, the normal switching path mutes the de
 
 An optional **Restart track after sample-rate changes (experimental)** setting pauses before a rate change and keeps the output device muted until the same track is confirmed back at its beginning. It is disabled by default, waits for the user's Play if already paused, and can take ten seconds or longer. While enabled, failed audio recovery stops for manual handling instead of automatically skipping tracks or restarting Apple Music. The first manually played track may still be audible briefly before mute control is obtained; about two seconds was reported in the independent test build. See [guarded track restart](GUARDED_TRACK_RESTART.md) for the behavior, limitations, and manual test procedure.
 
+The main window and tray flyout also provide **Restart Tool** and **Restart Apple Music and Tool**, plus categorized recovery guidance. Manual restart confirms a pause and waits for the old process to exit before reopening the same executable. Restarting Apple Music is a separate confirmed action that may lose the queue. After an explicit restart, monitoring waits for user Play even with the experimental option off; the saved option is unchanged. See [manual recovery controls](MANUAL_RECOVERY_CONTROLS.md) for the sequence and limits.
+
 Do also note that:
 
 - Normal live format switching can leave a few seconds of silence while the pipeline rebuilds, so audio may resume partway into the track. The optional restart sequence attempts to return the intended track to its beginning afterward. Same-rate tracks do not enter that new sequence, although existing format-lookup handling can still briefly mute output.

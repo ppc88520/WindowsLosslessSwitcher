@@ -1,4 +1,4 @@
-﻿<controls:NocturneWindow x:Class="WindowsLosslessSwitcher.Views.HeroWindow"
+<controls:NocturneWindow x:Class="WindowsLosslessSwitcher.Views.HeroWindow"
                          xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
                          xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                          xmlns:controls="clr-namespace:WindowsLosslessSwitcher.Controls"
@@ -18,6 +18,7 @@
     <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
   </controls:NocturneWindow.Resources>
   <Border BorderBrush="{StaticResource Nocturne.Brush.Ring}" BorderThickness="1">
+    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
     <StackPanel>
 
       <!-- Title bar (42px drag region) -->
@@ -174,6 +175,18 @@
                         Style="{StaticResource Nocturne.ToggleSwitch}" />
         </Grid>
 
+
+      <StackPanel Margin="0,12,0,0">
+        <Border Padding="10" CornerRadius="8" BorderBrush="{StaticResource Nocturne.Brush.Ring}" BorderThickness="1"
+                Visibility="{Binding HasRecoveryAdvice, Converter={StaticResource BoolToVisibility}}">
+          <StackPanel>
+            <TextBlock Text="{Binding RecoveryTitle}" FontWeight="SemiBold" TextWrapping="Wrap" />
+            <TextBlock Margin="0,6,0,0" Text="{Binding RecoveryMessage}" TextWrapping="Wrap" Foreground="{StaticResource Nocturne.Brush.Text75}" />
+          </StackPanel>
+        </Border>
+        <Button Margin="0,8,0,0" Padding="12,8" Content="Restart Tool" Command="{Binding RestartToolCommand}" Style="{StaticResource Nocturne.Button.Ghost}" />
+        <Button Margin="0,6,0,0" Padding="12,8" Content="Restart Apple Music and Tool" Command="{Binding RestartPlayerAndToolCommand}" Style="{StaticResource Nocturne.Button.Ghost}" />
+      </StackPanel>
         <Grid Margin="0,14,0,0">
           <Grid.ColumnDefinitions>
             <ColumnDefinition Width="*" />
@@ -204,5 +217,6 @@
       </StackPanel>
 
     </StackPanel>
+    </ScrollViewer>
   </Border>
 </controls:NocturneWindow>

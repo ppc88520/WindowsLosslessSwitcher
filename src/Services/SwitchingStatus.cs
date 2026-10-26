@@ -9,4 +9,5 @@ public sealed record SwitchingStatus(
     ResolvedAudioFormat? RequestedFormat,
     AudioFormatCandidate? AppliedFormat,
     string? FailureReason,
-    bool WasFormatChanged = false);
+    bool WasFormatChanged = false,
+    RecoveryCategory Recovery = RecoveryCategory.None);

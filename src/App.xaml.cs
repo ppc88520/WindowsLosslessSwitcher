@@ -28,6 +28,8 @@ public partial class App : Application
     private SwitchingCoordinator? _coordinator;
     private FormatCacheStore? _formatCacheStore;
     private bool _clearFormatCacheInFlight;
+    private bool _manualRestartInProgress;
+    private readonly RecoveryNotificationGate _recoveryNotifications = new();
     private AppSettings? _settings;
     private SwitchingStatus? _latestStatus;
     private AppleMusicTrackSource? _trackSource;
@@ -92,6 +94,8 @@ public partial class App : Application
         _viewModel.RestoreOriginalFormatRequested += OnRestoreOriginalFormatRequested;
         _viewModel.ClearFormatCacheRequested += OnClearFormatCacheRequested;
         _viewModel.OpenSettingsWindowRequested += ShowSettingsWindow;
+        _viewModel.RestartToolRequested += OnRestartToolRequested;
+        _viewModel.RestartPlayerAndToolRequested += OnRestartPlayerAndToolRequested;
 
         _trayIconHost = new TrayIconHost();
         _trayIconHost.OpenRequested += ShowMainWindow;
@@ -162,7 +166,25 @@ public partial class App : Application
         CaptureOriginalTargetFormatIfMissing();
         UpdateFormatCacheStatus();
         await _appUpdater.InitializeAsync(CancellationToken.None);
+        if (e.Args.Contains(ManualRestartHandoff.StartupArgument, StringComparer.Ordinal))
+        {
+            // This temporary source has no coordinator subscribers: it cannot switch or Play.
+            var paused = false;
+            try { paused = await Task.Run(ConfirmRestartStartupPauseAsync).WaitAsync(TimeSpan.FromSeconds(14)); }
+            catch (Exception ex) { _logger.Warn("Restart startup pause was not confirmed: " + ex.Message); }
+            if (!paused)
+            {
+                // Attach only for a later explicit retry; automatic switching stays stopped.
+                await _trackSource!.StartAsync(CancellationToken.None);
+                _viewModel.SetLifecycleNotice("Automatic switching is paused after restart", "Apple Music could not be confirmed paused. Pause it manually, then choose Restart Tool. No format, navigation, or Play command will be issued.");
+                ShowMainWindow();
+                return;
+            }
+            _coordinator.WaitForUserPlaybackAfterManualRestart();
+        }
         await _coordinator.StartAsync(_settings, CancellationToken.None);
+        if (e.Args.Contains("--manual-player-restart-failed", StringComparer.Ordinal))
+            _viewModel.SetLifecycleNotice("Tool restarted; player restart not confirmed", "Check Apple Music, select a track, and press Play manually. The restart will not be retried automatically.");
         ApplyStartupRegistration();
         _ = CheckForUpdatesAsync(userInitiated: false);
 
@@ -194,19 +216,28 @@ public partial class App : Application
         _viewModel.RestoreOriginalFormatRequested -= OnRestoreOriginalFormatRequested;
         _viewModel.ClearFormatCacheRequested -= OnClearFormatCacheRequested;
         _viewModel.OpenSettingsWindowRequested -= ShowSettingsWindow;
+        _viewModel.RestartToolRequested -= OnRestartToolRequested;
+        _viewModel.RestartPlayerAndToolRequested -= OnRestartPlayerAndToolRequested;
         _instanceGuard.Dispose();
         base.OnExit(e);
     }
 
     private void OnCoordinatorStatusChanged(object? sender, SwitchingStatus status)
     {
+        if (_manualRestartInProgress) return;
         _latestStatus = status;
         // BeginInvoke (not Invoke): a synchronous dispatch blocks the coordinator's switching
         // pipeline for hundreds of milliseconds per status update, delaying the track-change
         // mute/pause and letting the new track play audibly at the old format.
         Dispatcher.BeginInvoke(() =>
         {
+            if (_manualRestartInProgress) return;
             _viewModel.UpdateStatus(status);
+            if (_recoveryNotifications.ShouldNotify(status))
+            {
+                var advice = RecoveryAdvice.From(status);
+                _trayIconHost?.ShowRecoveryNotification(advice.Title, advice.Message);
+            }
             UpdateActiveTargetCapabilities();
             _trayIconHost?.UpdateStatus(status.ResolverStatusText);
             RefreshCurrentFormatDisplays();
@@ -608,8 +639,75 @@ public partial class App : Application
         _settingsWindow.Activate();
     }
 
+    private void OnRestartToolRequested() => _ = RestartManuallyAsync(ManualRestartMode.ToolOnly);
+    private void OnRestartPlayerAndToolRequested() => _ = RestartManuallyAsync(ManualRestartMode.AppleMusicAndTool);
+
+    private async Task RestartManuallyAsync(ManualRestartMode mode)
+    {
+        if (_manualRestartInProgress || _viewModel.IsRestartBusy || _coordinator is null) return;
+        _viewModel.IsRestartBusy = true;
+        string? requestPath = null;
+        try
+        {
+            // IsRestartBusy claims both commands during the modal loop. Ordinary status
+            // updates remain visible until the user confirms, including after Cancel.
+            if (mode == ManualRestartMode.AppleMusicAndTool && System.Windows.MessageBox.Show(
+                "This will close and reopen Apple Music and Windows Lossless Switcher. The play queue may not be preserved. Select a track and press Play yourself afterward. Continue?",
+                ManualRestartHandoff.ApplicationName, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
+                return;
+            _manualRestartInProgress = true;
+            _logger.Info($"Manual restart requested: mode={mode}; previousStatus={_latestStatus?.ResolverStatusText}.");
+            using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var coordinator = _coordinator;
+            var prepared = await Task.Run(() => coordinator.PrepareForManualRestartAsync(
+                deadline.Token, noPlayerProcess: !ManualRestartHandoff.IsAppleMusicRunning())).WaitAsync(TimeSpan.FromSeconds(11));
+            if (!prepared)
+            {
+                _viewModel.SetLifecycleNotice("Restart stopped: pause not confirmed", "Automatic processing has been suspended. Pause Apple Music manually, then retry. The application was not forcibly closed and its protective mute was not released.");
+                return;
+            }
+            requestPath = await ManualRestartHandoff.StartHelperAsync(mode, CancellationToken.None);
+            // The user could have pressed Play while the helper started. Recheck before
+            // Dispose releases owned mute, using the same bounded preparation barrier.
+            if (!await Task.Run(() => coordinator.PrepareForManualRestartAsync(deadline.Token,
+                    noPlayerProcess: !ManualRestartHandoff.IsAppleMusicRunning())).WaitAsync(TimeSpan.FromSeconds(4)))
+                throw new InvalidOperationException("Apple Music was no longer confirmed paused before exit.");
+            // Explicit cleanup is the barrier; WPF's async-void OnExit cannot provide it.
+            await coordinator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(15));
+            _coordinator = null;
+            ExitApplication();
+        }
+        catch (Exception ex)
+        {
+            if (requestPath is not null) ManualRestartHandoff.Cancel(requestPath);
+            _logger.Error("Manual restart did not complete.", ex);
+            _viewModel.SetLifecycleNotice("Restart did not complete", "Pause Apple Music before retrying. If the tool cannot exit, quit it from the tray and launch it manually. Reason: " + ex.Message);
+        }
+        finally
+        {
+            _viewModel.IsRestartBusy = false;
+            _manualRestartInProgress = false;
+        }
+    }
+
+    private async Task<bool> ConfirmRestartStartupPauseAsync()
+    {
+        if (!ManualRestartHandoff.IsAppleMusicRunning()) return true;
+        using var deadline = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        await using var probe = new AppleMusicTrackSource(_logger);
+        await probe.StartAsync(deadline.Token).WaitAsync(deadline.Token);
+        while (!deadline.IsCancellationRequested)
+        {
+            if (probe.GetPlaybackState().PlaybackStatus != MediaTransportPlaybackStatus.Unknown)
+                return await ManualRestartSafety.ConfirmPausedAsync(probe, deadline.Token);
+            await Task.Delay(100, deadline.Token);
+        }
+        return false;
+    }
+
     private void ExitApplication()
     {
+        if (_manualRestartInProgress && _coordinator is not null) return;
         _mainWindow?.AllowCloseAndClose();
         _settingsWindow?.AllowCloseAndClose();
         Shutdown();
