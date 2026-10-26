@@ -167,12 +167,14 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
     private static readonly TimeSpan RestartPauseConfirmationTimeout = TimeSpan.FromSeconds(2);
     private static readonly TimeSpan RestartConfirmationPollInterval = TimeSpan.FromMilliseconds(50);
     private static readonly TimeSpan PreviousRestartMinimumPosition = GuardedPreviousRestart.MinimumPosition;
+    private static readonly TimeSpan PreviousRestartReadinessTimeout = TimeSpan.FromSeconds(5);
     private static readonly TimeSpan PausedSwitchRestartReadinessTimeout = TimeSpan.FromSeconds(15);
-    private const string PreviousRestartManualRecoveryMessage = "Previous-restart manual recovery required: the current song could not be verified. Automatic switching is suspended. Pause Apple Music, exit the switcher, select the intended song, then restart the switcher.";
+    private const string PreviousRestartManualRecoveryMessage = "Playback manual recovery required: a safe restart could not be confirmed. Automatic switching is suspended. Pause Apple Music, exit the switcher, select the intended song, then reopen the switcher.";
 
 
     private readonly ITrackSource _trackSource;
     private readonly IMediaTransportController _mediaTransportController;
+    private readonly IPlaybackStateNotifier? _playbackStateNotifier;
     private readonly ResolverChain _resolverChain;
     private readonly FormatCacheVerificationService? _formatCacheVerificationService;
     private readonly IAudioEndpointController _audioEndpointController;
@@ -193,6 +195,9 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
     private long _currentTrackGeneration;
     private volatile bool _previousRestartGuardActive;
     private volatile bool _previousRestartSafetyHold;
+    private string? _previousRestartSafetyHoldDetail;
+    private volatile ManualTrackHold? _manualTrackHold;
+    private DeferredRateSwitch? _deferredRateSwitch;
     private volatile bool _stopping;
     private bool _cacheVerificationStopping;
 
@@ -253,6 +258,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
     {
         _trackSource = trackSource;
         _mediaTransportController = mediaTransportController;
+        _playbackStateNotifier = mediaTransportController as IPlaybackStateNotifier ?? trackSource as IPlaybackStateNotifier;
         _resolverChain = resolverChain;
         if (formatCacheStore is not null && catalogResolverForCacheVerification is not null)
         {
@@ -278,6 +284,8 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         Settings = settings;
         PublishStatus(new SwitchingStatus("Resolver: Waiting for Apple Music", null, null, null, null, null));
         _trackSource.TrackChanged += OnTrackChanged;
+        if (_playbackStateNotifier is not null)
+            _playbackStateNotifier.PlaybackStateChanged += OnPlaybackStateChanged;
         await _trackSource.StartAsync(cancellationToken);
 
         _watchdogCts = new CancellationTokenSource();
@@ -384,6 +392,8 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             UnmuteTargetDeviceAfterProcessing();
         }
         _trackSource.TrackChanged -= OnTrackChanged;
+        if (_playbackStateNotifier is not null)
+            _playbackStateNotifier.PlaybackStateChanged -= OnPlaybackStateChanged;
         Task[] cacheVerificationTasks;
         lock (_cacheVerificationSync)
         {
@@ -429,8 +439,18 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
 
                 // Stay out of the way while a track is being processed: the pipeline's own
                 // checks own those windows, and pause/mute states would read as wedges here.
-                if (_previousRestartSafetyHold || _switchLock.CurrentCount == 0 || HasActiveTrackTasks())
+                if (_previousRestartSafetyHold || _manualTrackHold is not null ||
+                    _switchLock.CurrentCount == 0 || HasActiveTrackTasks())
                 {
+                    inactiveSince = null;
+                    continue;
+                }
+
+                if (HasDeferredRateSwitch())
+                {
+                    // Event delivery is not guaranteed on every Windows build. A census is
+                    // a fallback observer only; it never sends Play to end the user's pause.
+                    OnPlaybackStateChanged(this, _mediaTransportController.GetPlaybackState());
                     inactiveSince = null;
                     continue;
                 }
@@ -473,6 +493,15 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             {
                 return;
             }
+            catch (TimeoutException ex) when (Settings.RestartTrackAfterSampleRateChange)
+            {
+                var correlation = new DiagnosticsLogger.LogCorrelation(Volatile.Read(ref _currentTrackGeneration), _currentTrackKey ?? "unknown");
+                MuteTargetDeviceForProcessing(_lastTargetDeviceId, correlation);
+                SetPreviousRestartSafetyHold(correlation, "A playback command timed out and may still be queued. Automatic retries stopped. " + ex.Message);
+                PublishStatusIfCurrent(Volatile.Read(ref _currentTrackGeneration), new SwitchingStatus("Resolver: Failed", null,
+                    _currentTrackSnapshot, null, null, GetGlobalHoldMessage()));
+                inactiveSince = null;
+            }
             catch (Exception ex)
             {
                 _logger.Warn($"Playback watchdog cycle failed: {ex.Message}");
@@ -488,7 +517,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         await _switchLock.WaitAsync(watchdogToken);
         try
         {
-            if (_previousRestartSafetyHold)
+            if (_previousRestartSafetyHold || _manualTrackHold is not null || HasDeferredRateSwitch())
             {
                 return;
             }
@@ -511,9 +540,6 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             using var linked = CancellationTokenSource.CreateLinkedTokenSource(
                 watchdogToken,
                 _currentTrackCts?.Token ?? CancellationToken.None);
-            // A mid-track stall on a track whose processing applied a format switch may be
-            // switch-induced renderer damage; one with no applied switch is just a track Apple
-            // Music cannot play, and must stay off the restart-escalation path.
             var recovered = await TryRecoverPlaybackWithNudgesAsync(
                 deviceId, null, generation, null, null, null, correlation, linked.Token,
                 NoSwitchRecoveryNudgeLimit, switchApplied: Volatile.Read(ref _currentTrackSwitchApplied));
@@ -524,7 +550,9 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             else
             {
                 _lastWatchdogRecoveryFailureUtc = DateTimeOffset.UtcNow;
-                _logger.Warn("Watchdog: recovery did not restore audio; backing off before the next attempt.", correlation);
+                _logger.Warn(Settings.RestartTrackAfterSampleRateChange
+                    ? "Watchdog: recovery did not restore audio; automatic retries are stopped for the current track."
+                    : "Watchdog: recovery did not restore audio; backing off before the next attempt.", correlation);
             }
         }
         catch (OperationCanceledException)
@@ -547,8 +575,22 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
 
     private async void OnTrackChanged(object? sender, TrackSnapshot track)
     {
+        await HandleTrackNotificationAsync(track);
+    }
+
+    private async Task HandleTrackNotificationAsync(TrackSnapshot track, long? deferredGeneration = null)
+    {
         if (_stopping)
         {
+            return;
+        }
+        var manualHold = _manualTrackHold;
+        if (manualHold is not null &&
+            (manualHold.Track.UniqueKey == track.UniqueKey || AppleMusicTrackSource.IsPlaceholderTrack(track)))
+        {
+            _logger.Info("Current-track recovery remains held; duplicate or transient metadata cannot authorize playback.");
+            PublishStatusIfCurrent(manualHold.Generation, new SwitchingStatus(manualHold.Status, null, manualHold.Track,
+                null, null, manualHold.Reason));
             return;
         }
         if (_previousRestartGuardActive)
@@ -557,7 +599,9 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             _transportPausedByCoordinator = false;
             _logger.Warn("Previous-restart: a different track arrived during the guarded operation; automatic processing is suspended.");
         }
-        var (generation, cancellationToken) = BeginTrackProcessing(track);
+        var (generation, cancellationToken) = BeginTrackProcessing(track, deferredGeneration);
+        if (generation == 0)
+            return;
         var correlation = CreateCorrelation(generation, track);
         PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Detecting track", null, track, null, null, null));
         var processingTask = ProcessTrackAsync(track, generation, cancellationToken);
@@ -582,6 +626,155 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         }
     }
 
+    private bool HasDeferredRateSwitch()
+    {
+        lock (_processingSync)
+            return _deferredRateSwitch is not null;
+    }
+
+    private async void OnPlaybackStateChanged(object? sender, MediaTransportState state)
+    {
+        if (_stopping || _previousRestartSafetyHold || _manualTrackHold is not null)
+            return;
+        if (!state.IsPlaying)
+        {
+            if (state.PlaybackStatus is MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped or MediaTransportPlaybackStatus.Closed)
+            {
+                try { await ReleaseDeferredPauseMuteAsync(); }
+                catch (ObjectDisposedException) when (_stopping) { }
+                catch (Exception ex) { _logger.Warn("Deferred pause cleanup could not complete: " + ex.Message); }
+            }
+            return;
+        }
+        DeferredRateSwitch? pending;
+        lock (_processingSync)
+        {
+            pending = _deferredRateSwitch;
+            if (pending is null || pending.Generation != _currentTrackGeneration || pending.Track.UniqueKey != _currentTrackKey)
+                return;
+            // Claim once before any await: repeated Playing notifications cannot schedule
+            // several switches for one user resume.
+            _deferredRateSwitch = null;
+        }
+        var task = ResumeDeferredRateSwitchAsync(pending);
+        TrackTaskStarted(task);
+        try { await task; }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            if (!_stopping && Volatile.Read(ref _currentTrackGeneration) == pending.Generation)
+            {
+                var correlation = CreateCorrelation(pending.Generation, pending.Track);
+                SetPreviousRestartSafetyHold(correlation, "Deferred switch failed before a safe resume: " + ex.Message);
+                PublishStatusIfCurrent(pending.Generation, new SwitchingStatus("Resolver: Failed", null, pending.Track,
+                    null, null, GetGlobalHoldMessage()));
+            }
+        }
+        finally { TrackTaskCompleted(task); }
+    }
+
+    private async Task ReleaseDeferredPauseMuteAsync()
+    {
+        // Never release mute belonging to a real switch. A non-blocking acquisition
+        // leaves active processing alone; the observer will check again next cycle.
+        if (_stopping || !HasDeferredRateSwitch() || !await _switchLock.WaitAsync(0))
+            return;
+        try
+        {
+            DeferredRateSwitch? pending;
+            lock (_processingSync)
+            {
+                if (_stopping || _previousRestartSafetyHold || _manualTrackHold is not null ||
+                    _deferredRateSwitch is null || _deferredRateSwitch.Generation != _currentTrackGeneration)
+                    return;
+                pending = _deferredRateSwitch;
+            }
+            // Media-session calls can marshal across apartments; do not make them
+            // while holding the coordinator's generation lock.
+            var state = _mediaTransportController.GetPlaybackState();
+            if (state.PlaybackStatus is MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped or MediaTransportPlaybackStatus.Closed)
+            {
+                lock (_processingSync)
+                    if (!_stopping && !_previousRestartSafetyHold && _manualTrackHold is null &&
+                        ReferenceEquals(pending, _deferredRateSwitch) && pending.Generation == _currentTrackGeneration)
+                    UnmuteTargetDeviceAfterProcessing(CreateCorrelation(pending.Generation, pending.Track));
+            }
+        }
+        finally
+        {
+            try { _switchLock.Release(); }
+            catch (ObjectDisposedException) when (_stopping) { }
+        }
+    }
+
+    private async Task ResumeDeferredRateSwitchAsync(DeferredRateSwitch pending)
+    {
+        var resume = false;
+        await _switchLock.WaitAsync(pending.CancellationToken);
+        try
+        {
+            EnsureRestartIsCurrent(pending.Generation, pending.CancellationToken);
+            if (_previousRestartSafetyHold || _manualTrackHold is not null)
+                return;
+            var state = _mediaTransportController.GetPlaybackState();
+            if (!state.IsPlaying)
+            {
+                // The user paused again before we acquired the lock. Keep waiting without
+                // touching the device or issuing Play.
+                if (state.PlaybackStatus == MediaTransportPlaybackStatus.Paused)
+                {
+                    lock (_processingSync)
+                        if (!_stopping && pending.Generation == _currentTrackGeneration)
+                            _deferredRateSwitch = pending;
+                    UnmuteTargetDeviceAfterProcessing(CreateCorrelation(pending.Generation, pending.Track));
+                }
+                return;
+            }
+            var correlation = CreateCorrelation(pending.Generation, pending.Track);
+            // A Playing event can precede resolved metadata. No device or navigation
+            // command has been sent here; allow one later fresh check on this generation.
+            MuteTargetDeviceForProcessing(_lastTargetDeviceId, correlation);
+            var matching = _mediaTransportController is ITrackIdentityVerifier verifier &&
+                await verifier.IsCurrentTrackAsync(pending.Track, pending.CancellationToken);
+            EnsureRestartIsCurrent(pending.Generation, pending.CancellationToken);
+            if (!matching)
+            {
+                if (pending.VerificationRetries == 0)
+                {
+                    lock (_processingSync)
+                        if (!_stopping && pending.Generation == _currentTrackGeneration)
+                            _deferredRateSwitch = pending with { VerificationRetries = 1 };
+                    if (_mediaTransportController.GetPlaybackState().PlaybackStatus == MediaTransportPlaybackStatus.Paused)
+                        UnmuteTargetDeviceAfterProcessing(correlation);
+                    _logger.Info("Deferred rate switch: resumed playback metadata is not ready; one fresh verification will be attempted without issuing playback or format commands.", correlation);
+                    PublishStatusIfCurrent(pending.Generation, new SwitchingStatus("Switching: Waiting for user playback", null,
+                        pending.Track, null, null, "Playback resumed; waiting for a fresh same-track check before switching."));
+                    return;
+                }
+                SetPreviousRestartSafetyHold(correlation, "Deferred switch could not verify the expected resumed track after the bounded fresh check. No format or navigation command was sent.");
+                PublishStatusIfCurrent(pending.Generation, new SwitchingStatus("Resolver: Failed", null, pending.Track,
+                    null, null, GetGlobalHoldMessage()));
+                return;
+            }
+            EnsureRestartIsCurrent(pending.Generation, pending.CancellationToken);
+            resume = _mediaTransportController.GetPlaybackState().IsPlaying;
+            if (!resume)
+            {
+                lock (_processingSync)
+                    if (!_stopping && pending.Generation == _currentTrackGeneration)
+                        _deferredRateSwitch = pending;
+                UnmuteTargetDeviceAfterProcessing(correlation);
+            }
+        }
+        finally { _switchLock.Release(); }
+        if (resume)
+        {
+            _logger.Info("Deferred rate switch: user playback confirmed; re-evaluating the same current track and device before switching.",
+                CreateCorrelation(pending.Generation, pending.Track));
+            await HandleTrackNotificationAsync(pending.Track, pending.Generation);
+        }
+    }
+
     private async Task ProcessTrackAsync(TrackSnapshot track, long generation, CancellationToken cancellationToken)
     {
         var pausedPlayback = false;
@@ -602,7 +795,12 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             cancellationToken.ThrowIfCancellationRequested();
             if (_previousRestartSafetyHold || _stopping)
             {
-                PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", null, track, null, null, PreviousRestartManualRecoveryMessage));
+                PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", null, track, null, null, GetGlobalHoldMessage()));
+                return;
+            }
+            if (_manualTrackHold is { } manualHold && manualHold.Track.UniqueKey == track.UniqueKey)
+            {
+                PublishStatusIfCurrent(generation, new SwitchingStatus(manualHold.Status, null, track, null, null, manualHold.Reason));
                 return;
             }
             _logger.Info($"Processing track {track.UniqueKey} detected at {track.DetectedAtUtc:O}.", correlation);
@@ -908,6 +1106,11 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            if (ex is TimeoutException && Settings.RestartTrackAfterSampleRateChange)
+            {
+                MuteTargetDeviceForProcessing(_lastTargetDeviceId, correlation);
+                SetPreviousRestartSafetyHold(correlation, "A playback command timed out and may still be queued. No automatic retry is safe. " + ex.Message);
+            }
             if (pausedPlayback && !resumeAttempted)
             {
                 await ResumePlaybackAfterPauseAsync(targetDeviceName, CancellationToken.None);
@@ -923,7 +1126,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             {
                 // Never leave the device muted unless a superseding track's processing now
                 // owns the mute and will release it itself.
-                if (!_previousRestartSafetyHold && Volatile.Read(ref _currentTrackGeneration) == generation)
+                if (!_previousRestartSafetyHold && _manualTrackHold is null && Volatile.Read(ref _currentTrackGeneration) == generation)
                 {
                     UnmuteTargetDeviceAfterProcessing(correlation);
                 }
@@ -1230,7 +1433,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
 
     private async Task<bool> ResumePlaybackAfterPauseAsync(string? targetDeviceName, CancellationToken cancellationToken)
     {
-        if (_stopping)
+        if (_stopping || _previousRestartSafetyHold || _manualTrackHold is not null)
         {
             return false;
         }
@@ -1256,7 +1459,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             for (var attempt = 1; attempt <= ResumePlayAttemptLimit; attempt++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (_stopping)
+                if (_stopping || _previousRestartSafetyHold || _manualTrackHold is not null)
                 {
                     return false;
                 }
@@ -1291,6 +1494,11 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            throw;
+        }
+        catch (TimeoutException) when (Settings.RestartTrackAfterSampleRateChange)
+        {
+            // The remote Play may still execute; do not treat timeout as rejection.
             throw;
         }
         catch (Exception ex)
@@ -1352,7 +1560,10 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             await verifier.IsCurrentTrackAsync(track, cancellationToken);
         EnsureRestartIsCurrent(generation, cancellationToken);
         if (!verified)
+        {
+            MuteTargetDeviceForProcessing(_lastTargetDeviceId, correlation);
             SetPreviousRestartSafetyHold(correlation, "Fresh track/session identity could not be verified; no further playback command was sent.");
+        }
         return verified;
     }
 
@@ -1364,19 +1575,25 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         void Hold(string reason)
         {
             MuteTargetDeviceForProcessing(targetDevice.Id, correlation);
-            SetPreviousRestartSafetyHold(correlation, reason);
+            if (!_previousRestartSafetyHold)
+                SetPreviousRestartSafetyHold(correlation, reason);
             PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", targetDevice.FriendlyName, track,
-                resolved, appliedFormat, PreviousRestartManualRecoveryMessage + " " + reason,
+                resolved, appliedFormat, GetGlobalHoldMessage(),
                 WasFormatChanged: appliedFormat is not null));
         }
 
         try
         {
-            MuteTargetDeviceForProcessing(targetDevice.Id, correlation);
-            if (_audioEndpointController.GetMasterMute(targetDevice.Id) != true)
+            var entryState = _mediaTransportController.GetPlaybackState();
+            var wasUserPaused = entryState.PlaybackStatus == MediaTransportPlaybackStatus.Paused && !_transportPausedByCoordinator;
+            if (!wasUserPaused)
             {
-                Hold("Pause-switch canceled: endpoint mute could not be verified; no format or navigation command was sent.");
-                return;
+                MuteTargetDeviceForProcessing(targetDevice.Id, correlation);
+                if (_audioEndpointController.GetMasterMute(targetDevice.Id) != true)
+                {
+                    Hold("Pause-switch canceled: endpoint mute could not be verified; no format or navigation command was sent.");
+                    return;
+                }
             }
             if (!await VerifyExpectedTrackAsync(track, generation, correlation, cancellationToken))
             {
@@ -1392,7 +1609,26 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
                 EnsureRestartIsCurrent(generation, cancellationToken);
                 state = _mediaTransportController.GetPlaybackState();
             }
-            var resumeOurPause = state.IsPlaying || _transportPausedByCoordinator;
+            if (state.PlaybackStatus == MediaTransportPlaybackStatus.Paused && !_transportPausedByCoordinator)
+            {
+                EnsureRestartIsCurrent(generation, cancellationToken);
+                lock (_processingSync)
+                {
+                    if (!_stopping && generation == _currentTrackGeneration)
+                        _deferredRateSwitch = new DeferredRateSwitch(track, generation, cancellationToken);
+                }
+                _logger.Info("Deferred rate switch: the user already paused this track; keeping the device format unchanged until user playback is observed.", correlation);
+                PublishStatusIfCurrent(generation, new SwitchingStatus("Switching: Waiting for user playback", targetDevice.FriendlyName,
+                    track, resolved, decision.CurrentDeviceFormat,
+                    "Playback is paused by the user. The device format will be re-evaluated after the user presses Play."));
+                return;
+            }
+            MuteTargetDeviceForProcessing(targetDevice.Id, correlation);
+            if (_audioEndpointController.GetMasterMute(targetDevice.Id) != true)
+            {
+                Hold("Pause-switch canceled: endpoint mute could not be verified before pausing.");
+                return;
+            }
             if (state.IsPlaying)
             {
                 _transportPausedByCoordinator = await _mediaTransportController.TryPauseAsync(cancellationToken);
@@ -1453,14 +1689,6 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
                 return;
             }
             _logger.Info($"Pause-switch: target format confirmed {appliedFormat?.DisplayName}; endpoint remains muted.", correlation);
-            if (!resumeOurPause)
-            {
-                _logger.Info("Pause-switch: playback was already paused by the user; leaving it paused without navigation or automatic Play.", correlation);
-                PublishStatusIfCurrent(generation, new SwitchingStatus("Switching: Format changed; playback paused", targetDevice.FriendlyName,
-                    track, resolved, appliedFormat, "Playback remains paused by the user.", WasFormatChanged: true));
-                return;
-            }
-
             if (!await VerifyExpectedTrackAsync(track, generation, correlation, cancellationToken))
             {
                 Hold("Pause-switch: current item was not verified before muted warmup.");
@@ -1531,10 +1759,12 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
                 return;
             }
             var restart = await TryRestartTrackAfterRateChangeAsync(targetDevice.Id, track, generation, correlation, cancellationToken,
-                mutedPlayingTimer: warmup.PlayingTimer, expectedFormat: decision.SelectedFormat);
+                requireConfirmedZero: true, mutedPlayingTimer: warmup.PlayingTimer, expectedFormat: decision.SelectedFormat);
             EnsureRestartIsCurrent(generation, cancellationToken);
             if (!restart.PlaybackRestored)
             {
+                if (_manualTrackHold is { } held && held.Generation == generation)
+                    return;
                 Hold(restart.Note ?? "Pause-switch: same-track 0:00 and audible playback could not be confirmed.");
                 return;
             }
@@ -1599,15 +1829,17 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         long generation,
         DiagnosticsLogger.LogCorrelation correlation,
         CancellationToken cancellationToken,
-        Stopwatch? mutedPlayingTimer,
-        AudioFormatCandidate? expectedFormat)
+        bool requireConfirmedZero = false,
+        Stopwatch? mutedPlayingTimer = null,
+        AudioFormatCandidate? expectedFormat = null)
     {
         EnsureRestartIsCurrent(generation, cancellationToken);
         RestartAtZeroResult Unconfirmed(string reason)
         {
             _logger.Warn(reason, correlation);
-            SetPreviousRestartSafetyHold(correlation, reason);
-            return new(false, reason);
+            if (requireConfirmedZero)
+                SetPreviousRestartSafetyHold(correlation, reason);
+            return new(!requireConfirmedZero, reason);
         }
         if (_mediaTransportController is not IPreviousTrackRestarter restarter)
         {
@@ -1624,7 +1856,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         EnsureRestartIsCurrent(generation, cancellationToken);
         if (!state.IsPlaying)
         {
-            if (state.PlaybackStatus is not (MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped or MediaTransportPlaybackStatus.Closed))
+            if (requireConfirmedZero && state.PlaybackStatus is not (MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped or MediaTransportPlaybackStatus.Closed))
                 return Unconfirmed("Previous-restart canceled: transport was unavailable before the 0:00 guard.");
             _logger.Info("Previous-restart skipped: playback is no longer playing; respecting the user's pause.", correlation);
             return new(true, null);
@@ -1640,8 +1872,8 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         var readiness = Stopwatch.StartNew();
         while (state.TimelinePosition is { } position &&
                (position < PreviousRestartMinimumPosition ||
-                (mutedPlayingTimer is null || mutedPlayingTimer.Elapsed < PreviousRestartMinimumPosition)) &&
-               readiness.Elapsed < PausedSwitchRestartReadinessTimeout)
+                (requireConfirmedZero && (mutedPlayingTimer is null || mutedPlayingTimer.Elapsed < PreviousRestartMinimumPosition))) &&
+               readiness.Elapsed < (requireConfirmedZero ? PausedSwitchRestartReadinessTimeout : PreviousRestartReadinessTimeout))
         {
             EnsureRestartIsCurrent(generation, cancellationToken);
             await Task.Delay(RestartConfirmationPollInterval, cancellationToken);
@@ -1649,13 +1881,13 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             EnsureRestartIsCurrent(generation, cancellationToken);
             if (!state.IsPlaying)
             {
-                if (state.PlaybackStatus is not (MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped or MediaTransportPlaybackStatus.Closed))
+                if (requireConfirmedZero && state.PlaybackStatus is not (MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped or MediaTransportPlaybackStatus.Closed))
                     return Unconfirmed("Previous-restart canceled: transport became unavailable during muted preparation.");
                 return new(true, null);
             }
         }
         if (state.TimelinePosition is not { } readyPosition || readyPosition < PreviousRestartMinimumPosition ||
-            (mutedPlayingTimer is null || mutedPlayingTimer.Elapsed < PreviousRestartMinimumPosition))
+            (requireConfirmedZero && (mutedPlayingTimer is null || mutedPlayingTimer.Elapsed < PreviousRestartMinimumPosition)))
         {
             const string positionNote = "Previous-restart skipped: position is unknown or still below the conservative 10-second threshold.";
             return Unconfirmed(positionNote);
@@ -1666,7 +1898,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         try
         {
             EnsureRestartIsCurrent(generation, cancellationToken);
-            if (!await VerifyExpectedTrackAsync(track, generation, correlation, cancellationToken))
+            if (requireConfirmedZero && !await VerifyExpectedTrackAsync(track, generation, correlation, cancellationToken))
                 return new(false, PreviousRestartManualRecoveryMessage);
             ownsPause = await _mediaTransportController.TryPauseAsync(cancellationToken);
             if (ownsPause)
@@ -1697,7 +1929,9 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             EnsureRestartIsCurrent(generation, cancellationToken);
             if (state.PlaybackStatus != MediaTransportPlaybackStatus.Paused)
             {
-                return Unconfirmed("Previous-restart skipped: pause could not be confirmed; no Previous command was sent.");
+                if (requireConfirmedZero)
+                    return Unconfirmed("Previous-restart skipped: pause could not be confirmed; no Previous command was sent.");
+                return new(false, "Previous-restart skipped: pause could not be confirmed; no Previous command was sent.");
             }
 
             await Task.Delay(PlaybackRecoveryNudgeDelay, cancellationToken);
@@ -1718,7 +1952,29 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
                 _logger.Info("Previous-restart: starting the guarded single-Previous operation.", correlation);
                 result = await restarter.TryRestartWithPreviousAsync(track, precedingTrack, cancellationToken);
                 EnsureRestartIsCurrent(generation, cancellationToken);
-                if (!result.SafeToResume || !result.Restarted)
+                if (result.CanRecoverOnNewTrack)
+                {
+                    // The transport has freshly verified the paused item and explicitly
+                    // proved that no navigation was dispatched. Do not turn this into a
+                    // permanent global lock or audible resume from ten seconds.
+                    if (_mediaTransportController.GetPlaybackState().PlaybackStatus != MediaTransportPlaybackStatus.Paused)
+                    {
+                        SetPreviousRestartSafetyHold(correlation, "The verified item was no longer paused after the no-navigation capability check.");
+                        ownsPause = false;
+                        return new(false, GetGlobalHoldMessage());
+                    }
+                    // The adapter proved that no navigation was sent. A new user-selected
+                    // track after publishing the recoverable status must not be mistaken
+                    // for a replacement during an in-flight navigation command.
+                    _previousRestartGuardActive = false;
+                    SetManualTrackHold(track, generation, "Switching: Restart unavailable",
+                        "Apple Music's Previous control is unavailable. No navigation was sent and the track remains paused. " +
+                        "Select a different song to continue, or pause Apple Music and exit the switcher before restarting this song manually.", correlation,
+                        expectedFormat ?? _audioEndpointController.GetCurrentDeviceFormat(deviceId), wasFormatChanged: true);
+                    ownsPause = false;
+                    return new(false, result.Detail);
+                }
+                if (!result.SafeToResume || (requireConfirmedZero && !result.Restarted))
                 {
                     SetPreviousRestartSafetyHold(correlation, result.Detail);
                     ownsPause = false;
@@ -1737,7 +1993,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             }
 
             EnsureRestartIsCurrent(generation, cancellationToken);
-            if (!await VerifyExpectedTrackAsync(track, generation, correlation, cancellationToken))
+            if (requireConfirmedZero && !await VerifyExpectedTrackAsync(track, generation, correlation, cancellationToken))
             {
                 ownsPause = false;
                 return new(false, PreviousRestartManualRecoveryMessage);
@@ -1755,22 +2011,31 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
                 ownsPause = false;
                 return new(false, PreviousRestartManualRecoveryMessage);
             }
-            if (state.PlaybackStatus != MediaTransportPlaybackStatus.Paused ||
+            if (requireConfirmedZero &&
+                (state.PlaybackStatus != MediaTransportPlaybackStatus.Paused ||
                  state.TimelinePosition is not { } zeroPosition || zeroPosition < TimeSpan.Zero ||
                  zeroPosition > GuardedPreviousRestart.PositionTolerance ||
                  _audioEndpointController.GetMasterMute(deviceId) != true ||
-                 (expectedFormat is not null && _audioEndpointController.GetCurrentDeviceFormat(deviceId) != expectedFormat))
+                 (expectedFormat is not null && _audioEndpointController.GetCurrentDeviceFormat(deviceId) != expectedFormat)))
             {
                 ownsPause = false;
                 return Unconfirmed("Same-track paused 0:00, endpoint mute or target format no longer held at the final audible-resume gate.");
             }
 
-            ownsPause = _transportPausedByCoordinator = true;
+            string? note = result.Restarted ? null : "Previous-restart was not confirmed; keeping the verified current track. " + result.Detail;
+            ownsPause = _transportPausedByCoordinator = state.PlaybackStatus == MediaTransportPlaybackStatus.Paused;
             resumeAttempted = true;
-            // Release mute before Play so confirmation does not consume the intro again.
-            if (!await ResumePlaybackAfterPauseAsync(null, cancellationToken))
+            if (ownsPause)
             {
-                return new(false, "Playback could not resume; use Play manually.");
+                // Release mute before Play so confirmation does not consume the intro again.
+                if (!await ResumePlaybackAfterPauseAsync(null, cancellationToken))
+                {
+                    return new(false, CombineFailureReason(note, "Playback could not resume; use Play manually."));
+                }
+            }
+            else
+            {
+                UnmuteTargetDeviceAfterProcessing(correlation);
             }
             EnsureRestartIsCurrent(generation, cancellationToken);
 
@@ -1778,19 +2043,26 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             EnsureRestartIsCurrent(generation, cancellationToken);
             if (!restored)
             {
-                return new(false, "Audio after the guarded restart was not confirmed; no further navigation was attempted.");
+                return new(false, CombineFailureReason(note, "Audio after the guarded restart was not confirmed; no further navigation was attempted."));
             }
 
-            _logger.Info("Previous-restart confirmed: the same current track returned to 0:00 and playback resumed unmuted.", correlation);
-            return new(true, null);
+            _logger.Info(
+                result.Restarted
+                    ? "Previous-restart confirmed: the same current track returned to 0:00 and playback resumed unmuted."
+                    : "Previous-restart fallback: the verified current track resumed without a confirmed rewind.",
+                correlation);
+            return new(true, note);
         }
         finally
         {
-            if (ownsPause && !resumeAttempted && !_previousRestartSafetyHold && !_stopping)
+            if (ownsPause && !resumeAttempted && !_previousRestartSafetyHold && _manualTrackHold is null && !_stopping)
             {
                 if (Volatile.Read(ref _currentTrackGeneration) == generation)
                 {
-                    SetPreviousRestartSafetyHold(correlation, "Restart ended before paused 0:00 was confirmed; automatic audible resume is forbidden.");
+                    if (requireConfirmedZero)
+                        SetPreviousRestartSafetyHold(correlation, "Restart ended before paused 0:00 was confirmed; automatic audible resume is forbidden.");
+                    else
+                        await ResumePlaybackAfterPauseAsync(null, CancellationToken.None);
                 }
                 else
                 {
@@ -1802,9 +2074,39 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
 
     private void SetPreviousRestartSafetyHold(DiagnosticsLogger.LogCorrelation correlation, string detail)
     {
+        var prefix = PreviousRestartManualRecoveryMessage;
+        if (detail.StartsWith(prefix, StringComparison.Ordinal))
+            detail = detail[prefix.Length..].Trim();
+        if (!_previousRestartSafetyHold || string.IsNullOrWhiteSpace(_previousRestartSafetyHoldDetail))
+            _previousRestartSafetyHoldDetail = detail;
         _previousRestartSafetyHold = true;
         _transportPausedByCoordinator = false;
-        _logger.Warn(PreviousRestartManualRecoveryMessage + " " + detail, correlation);
+        _manualTrackHold = null;
+        lock (_processingSync)
+            _deferredRateSwitch = null;
+        _logger.Warn(GetGlobalHoldMessage(), correlation);
+    }
+
+    private string GetGlobalHoldMessage() => string.IsNullOrWhiteSpace(_previousRestartSafetyHoldDetail)
+        ? PreviousRestartManualRecoveryMessage
+        : PreviousRestartManualRecoveryMessage + " " + _previousRestartSafetyHoldDetail;
+
+    private void SetManualTrackHold(TrackSnapshot track, long generation, string status, string reason,
+        DiagnosticsLogger.LogCorrelation correlation, AudioFormatCandidate? format = null, string? deviceName = null,
+        ResolvedAudioFormat? resolved = null, bool wasFormatChanged = false)
+    {
+        if (_stopping || generation != Volatile.Read(ref _currentTrackGeneration) || _previousRestartSafetyHold)
+            return;
+        lock (_processingSync)
+        {
+            if (_stopping || generation != _currentTrackGeneration || _previousRestartSafetyHold)
+                return;
+            _manualTrackHold = new ManualTrackHold(track, generation, status, reason, format, deviceName, resolved, wasFormatChanged);
+            _deferredRateSwitch = null;
+            _transportPausedByCoordinator = false;
+        }
+        _logger.Warn(reason, correlation);
+        PublishStatusIfCurrent(generation, new SwitchingStatus(status, deviceName, track, resolved, format, reason, wasFormatChanged));
     }
     private void EnsureRestartIsCurrent(long generation, CancellationToken cancellationToken)
     {
@@ -2006,6 +2308,13 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             return false;
         }
 
+        if (Settings.RestartTrackAfterSampleRateChange)
+        {
+            await HoldFailedRecoveryAsync(deviceId, targetDeviceName, generation, track, resolved,
+                verifiedDeviceFormat, correlation, cancellationToken, wasFormatChanged: switchApplied);
+            return false;
+        }
+
         if (!switchApplied)
         {
             // No format switch was applied, so this is not switch-induced renderer damage —
@@ -2116,6 +2425,67 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             correlation);
     }
 
+    private async Task HoldFailedRecoveryAsync(string deviceId, string? targetDeviceName, long generation,
+        TrackSnapshot? track, ResolvedAudioFormat? resolved, AudioFormatCandidate? verifiedDeviceFormat,
+        DiagnosticsLogger.LogCorrelation correlation, CancellationToken cancellationToken, bool wasFormatChanged)
+    {
+        EnsureRestartIsCurrent(generation, cancellationToken);
+        track ??= _currentTrackSnapshot;
+        MuteTargetDeviceForProcessing(deviceId, correlation);
+        if (track is null || _audioEndpointController.GetMasterMute(deviceId) != true)
+        {
+            SetPreviousRestartSafetyHold(correlation, "Playback recovery failed and a current track with muted output could not be confirmed. No track was skipped or player restarted.");
+            PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", targetDeviceName, track, resolved,
+                verifiedDeviceFormat, GetGlobalHoldMessage()));
+            return;
+        }
+        if (_mediaTransportController is ITrackIdentityVerifier verifier &&
+            !await verifier.IsCurrentTrackAsync(track, cancellationToken))
+        {
+            EnsureRestartIsCurrent(generation, cancellationToken);
+            SetPreviousRestartSafetyHold(correlation, "Playback recovery failed and current item identity changed before the final pause. No navigation was sent.");
+            PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", targetDeviceName, track, resolved,
+                verifiedDeviceFormat, GetGlobalHoldMessage()));
+            return;
+        }
+        EnsureRestartIsCurrent(generation, cancellationToken);
+        var state = _mediaTransportController.GetPlaybackState();
+        if (state.IsPlaying)
+        {
+            _transportPausedByCoordinator = await _mediaTransportController.TryPauseAsync(cancellationToken);
+            EnsureRestartIsCurrent(generation, cancellationToken);
+            if (!_transportPausedByCoordinator)
+            {
+                SetPreviousRestartSafetyHold(correlation, "Playback recovery failed; the final safety pause was rejected. Output remains held, without skipping or restarting Apple Music.");
+                PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", targetDeviceName, track, resolved,
+                    verifiedDeviceFormat, GetGlobalHoldMessage()));
+                return;
+            }
+            var pauseTimer = Stopwatch.StartNew();
+            do
+            {
+                state = _mediaTransportController.GetPlaybackState();
+                if (state.PlaybackStatus == MediaTransportPlaybackStatus.Paused)
+                    break;
+                await Task.Delay(RestartConfirmationPollInterval, cancellationToken);
+                EnsureRestartIsCurrent(generation, cancellationToken);
+            } while (pauseTimer.Elapsed < RestartPauseConfirmationTimeout);
+        }
+        if (state.PlaybackStatus is not (MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped or MediaTransportPlaybackStatus.Closed))
+        {
+            SetPreviousRestartSafetyHold(correlation, "Playback recovery failed; a final pause could not be confirmed. No track was skipped or player restarted.");
+            PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", targetDeviceName, track, resolved,
+                verifiedDeviceFormat, GetGlobalHoldMessage()));
+            return;
+        }
+        EnsureRestartIsCurrent(generation, cancellationToken);
+        SetManualTrackHold(track, generation, "Switching: Manual recovery needed",
+            "Playback recovery could not confirm audio. The current track is held and automatic retries are stopped. " +
+            "No track was skipped or player restarted. Select a different song to continue, or pause Apple Music and exit the switcher to recover manually.", correlation,
+            verifiedDeviceFormat ?? _audioEndpointController.GetCurrentDeviceFormat(deviceId), targetDeviceName, resolved,
+            wasFormatChanged: wasFormatChanged);
+    }
+
     private void RecordRecoveryFailure()
     {
         var cutoff = DateTimeOffset.UtcNow - CascadeFailureWindow;
@@ -2217,10 +2587,17 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
 
     private void PublishStatus(SwitchingStatus status) => StatusChanged?.Invoke(this, status);
 
-    private (long Generation, CancellationToken CancellationToken) BeginTrackProcessing(TrackSnapshot track)
+    private (long Generation, CancellationToken CancellationToken) BeginTrackProcessing(TrackSnapshot track, long? deferredGeneration = null)
     {
         lock (_processingSync)
         {
+            if (_manualTrackHold is { } held &&
+                (held.Track.UniqueKey == track.UniqueKey || AppleMusicTrackSource.IsPlaceholderTrack(track)))
+                return (0, new CancellationToken(canceled: true));
+            if (deferredGeneration is { } expected &&
+                (_stopping || _previousRestartSafetyHold || _manualTrackHold is not null ||
+                 _currentTrackGeneration != expected || _currentTrackKey != track.UniqueKey))
+                return (0, new CancellationToken(canceled: true));
             var supersededGeneration = _currentTrackGeneration;
             var supersededTrackKey = _currentTrackKey;
 
@@ -2242,6 +2619,14 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             }
             _currentTrackSnapshot = track;
             _currentTrackKey = track.UniqueKey;
+            _deferredRateSwitch = null;
+            if (_manualTrackHold is { } previousHold && previousHold.Track.UniqueKey != track.UniqueKey)
+            {
+                _logger.Info("A new current track cleared a no-navigation manual recovery hold; keeping owned mute until its processing completes.");
+                _manualTrackHold = null;
+                _transportPausedByCoordinator = false;
+                _lastWatchdogRecoveryFailureUtc = DateTimeOffset.MinValue;
+            }
             Volatile.Write(ref _suppressWatchdogUntilNextTrack, false);
             Volatile.Write(ref _currentTrackSwitchApplied, false);
             Volatile.Write(ref _patientRetryUsedForTrack, false);
@@ -2262,6 +2647,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             _currentTrackCts?.Dispose();
             _currentTrackCts = null;
             _currentTrackKey = null;
+            _deferredRateSwitch = null;
         }
     }
 
@@ -2315,6 +2701,22 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             return;
         }
 
+        if (_previousRestartSafetyHold)
+        {
+            status = status with { ResolverStatusText = "Resolver: Failed", FailureReason = GetGlobalHoldMessage() };
+        }
+        else if (_manualTrackHold is { } hold && hold.Generation == generation)
+        {
+            status = status with
+            {
+                ResolverStatusText = hold.Status,
+                FailureReason = hold.Reason,
+                ActiveDeviceName = status.ActiveDeviceName ?? hold.DeviceName,
+                RequestedFormat = status.RequestedFormat ?? hold.Resolved,
+                AppliedFormat = status.AppliedFormat ?? hold.Format,
+                WasFormatChanged = status.WasFormatChanged || hold.WasFormatChanged,
+            };
+        }
         PublishStatus(status);
     }
 
@@ -2503,6 +2905,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
             TrackProcessingStage.ResumeAfterSwitch => "playback resume",
             TrackProcessingStage.PlaybackRestoreObservation => "playback restore observation",
             TrackProcessingStage.PlaybackRecovery => "playback recovery",
+            TrackProcessingStage.RestartFromBeginning => "restart from 0:00",
             _ => "track processing",
         };
 
@@ -2516,6 +2919,7 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
         ResumeAfterSwitch,
         PlaybackRestoreObservation,
         PlaybackRecovery,
+        RestartFromBeginning,
     }
 
     private enum PlaybackHealthOutcome
@@ -2536,6 +2940,12 @@ public sealed class SwitchingCoordinator : IAsyncDisposable
     private sealed record DeviceReadyWaitResult(bool IsReady, AudioFormatCandidate? VerifiedFormat);
 
     private sealed record RestartAtZeroResult(bool PlaybackRestored, string? Note);
+
+    private sealed record DeferredRateSwitch(TrackSnapshot Track, long Generation, CancellationToken CancellationToken,
+        int VerificationRetries = 0);
+
+    private sealed record ManualTrackHold(TrackSnapshot Track, long Generation, string Status, string Reason,
+        AudioFormatCandidate? Format, string? DeviceName, ResolvedAudioFormat? Resolved, bool WasFormatChanged);
 
     private sealed record ResolvedTrackDecision(
         AudioFormatCandidate? CurrentDeviceFormat,

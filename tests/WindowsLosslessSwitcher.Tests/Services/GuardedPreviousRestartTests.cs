@@ -60,6 +60,155 @@ public sealed class GuardedPreviousRestartTests : IDisposable
         Assert.False(result.Restarted);
         Assert.True(result.SafeToResume);
         Assert.Equal(0, session.PreviousCount);
+        Assert.Equal(PreviousRestartFailureKind.PreviousUnavailable, result.FailureKind);
+        Assert.False(result.NavigationDispatched);
+        Assert.True(result.CanRecoverOnNewTrack);
+        Assert.Equal(0, session.PlayCount);
+        Assert.Equal(0, session.NextCount);
+        Assert.True(session.ReadCount > 1);
+    }
+
+    [Fact]
+    public async Task Previous_CapabilityBecomesAvailableWhilePausedSendsExactlyOnePrevious()
+    {
+        var session = new FakeSession { Snapshot = Snapshot() with { CanPrevious = false } };
+        session.ReadInvoked = () =>
+        {
+            if (session.ReadCount == 4)
+                session.Snapshot = session.Snapshot! with { CanPrevious = true };
+        };
+        session.PreviousInvoked = () => session.Snapshot = session.Snapshot! with { Position = TimeSpan.Zero };
+
+        var result = await RunAsync(session);
+
+        Assert.True(result.Restarted, result.Detail);
+        Assert.True(result.SafeToResume);
+        Assert.Equal(1, session.PreviousCount);
+        Assert.Equal(0, session.PlayCount);
+        Assert.Equal(0, session.NextCount);
+        Assert.False(result.CanRecoverOnNewTrack);
+        Assert.True(session.ReadCount >= 6);
+    }
+
+    [Fact]
+    public async Task Previous_CapabilityLossAtFinalRecheckWaitsRatherThanBlindlyDispatching()
+    {
+        var session = new FakeSession();
+        session.ReadInvoked = () =>
+        {
+            if (session.ReadCount == 2)
+                session.Snapshot = session.Snapshot! with { CanPrevious = false };
+            if (session.ReadCount == 4)
+                session.Snapshot = session.Snapshot! with { CanPrevious = true };
+        };
+        session.PreviousInvoked = () =>
+        {
+            Assert.True(session.Snapshot!.CanPrevious);
+            session.Snapshot = session.Snapshot with { Position = TimeSpan.Zero };
+        };
+
+        var result = await RunAsync(session);
+
+        Assert.True(result.Restarted, result.Detail);
+        Assert.Equal(1, session.PreviousCount);
+        Assert.Equal(0, session.PlayCount);
+        Assert.Equal(0, session.NextCount);
+    }
+
+    [Theory]
+    [InlineData("session")]
+    [InlineData("track")]
+    [InlineData("navigation")]
+    public async Task Previous_OperationChangesDuringCapabilityWaitCannotNavigateOrBecomeRecoverable(string change)
+    {
+        var session = new FakeSession { Snapshot = Snapshot() with { CanPrevious = false } };
+        session.ReadInvoked = () =>
+        {
+            if (session.ReadCount != 3) return;
+            session.Snapshot = change switch
+            {
+                "session" => session.Snapshot! with { SessionId = "replacement" },
+                "track" => session.Snapshot! with { Track = Unknown },
+                _ => session.Snapshot! with { NavigationRevision = 1 },
+            };
+        };
+
+        var result = await RunAsync(session);
+
+        Assert.False(result.Restarted);
+        Assert.False(result.SafeToResume);
+        Assert.False(result.CanRecoverOnNewTrack);
+        Assert.False(result.NavigationDispatched);
+        Assert.Equal(0, session.PreviousCount);
+        Assert.Equal(0, session.NextCount);
+        Assert.Equal(0, session.PlayCount);
+        Assert.Equal(0, session.PauseCount);
+    }
+
+    [Fact]
+    public async Task Previous_CancellationDuringCapabilityWaitSendsNoPlaybackOrNavigationCommand()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var session = new FakeSession { Snapshot = Snapshot() with { CanPrevious = false } };
+        session.ReadInvoked = () => { if (session.ReadCount == 2) cancellation.Cancel(); };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => CreateGuard(session)
+            .TryRestartWithPreviousAsync(Expected, Preceding, cancellation.Token));
+
+        Assert.Equal(0, session.PreviousCount);
+        Assert.Equal(0, session.NextCount);
+        Assert.Equal(0, session.PlayCount);
+        Assert.Equal(0, session.PauseCount);
+    }
+
+    [Fact]
+    public async Task Previous_AnUnresponsiveCapabilityReadCannotBecomeARecoverableKnownTrack()
+    {
+        var session = new FakeSession { Snapshot = Snapshot() with { CanPrevious = false } };
+        session.ReadHandler = _ => session.ReadCount == 1
+            ? Task.FromResult<PreviousRestartSnapshot?>(session.Snapshot)
+            : new TaskCompletionSource<PreviousRestartSnapshot?>().Task;
+
+        var result = await RunAsync(session).WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.False(result.Restarted);
+        Assert.False(result.SafeToResume);
+        Assert.False(result.CanRecoverOnNewTrack);
+        Assert.False(result.NavigationDispatched);
+        Assert.Equal(0, session.PreviousCount);
+        Assert.Equal(0, session.NextCount);
+        Assert.Equal(0, session.PlayCount);
+    }
+
+    [Theory]
+    [InlineData(MediaTransportPlaybackStatus.Playing)]
+    [InlineData(MediaTransportPlaybackStatus.Stopped)]
+    public async Task Previous_StateChangeDuringCapabilityWaitIsNotAnUnavailableControlRecovery(MediaTransportPlaybackStatus status)
+    {
+        var session = new FakeSession { Snapshot = Snapshot() with { CanPrevious = false } };
+        session.ReadInvoked = () =>
+        {
+            if (session.ReadCount == 2)
+                session.Snapshot = session.Snapshot! with { PlaybackStatus = status };
+        };
+
+        var result = await RunAsync(session);
+
+        Assert.False(result.Restarted);
+        Assert.False(result.CanRecoverOnNewTrack);
+        Assert.False(result.NavigationDispatched);
+        Assert.Equal(0, session.PreviousCount);
+        Assert.Equal(0, session.PlayCount);
+        Assert.Equal(0, session.NextCount);
+    }
+
+    [Fact]
+    public void Previous_UnclassifiedOrDispatchedResultsCannotClearSafetyOnANewTrack()
+    {
+        Assert.False(new PreviousRestartResult(false, true, "Unclassified").CanRecoverOnNewTrack);
+        Assert.False(new PreviousRestartResult(false, true, "Dispatched", PreviousRestartFailureKind.PreviousUnavailable, true).CanRecoverOnNewTrack);
+        Assert.False(new PreviousRestartResult(false, false, "Identity unknown", PreviousRestartFailureKind.PreviousUnavailable, false).CanRecoverOnNewTrack);
+        Assert.True(new PreviousRestartResult(false, true, "Verified unavailable; unsent", PreviousRestartFailureKind.PreviousUnavailable, false).CanRecoverOnNewTrack);
     }
 
     [Fact]
@@ -537,7 +686,8 @@ public sealed class GuardedPreviousRestartTests : IDisposable
         TimeSpan.FromSeconds(2),
         TimeSpan.FromMilliseconds(5),
         TimeSpan.FromMilliseconds(10),
-        TimeSpan.FromMilliseconds(20));
+        TimeSpan.FromMilliseconds(20),
+        TimeSpan.FromMilliseconds(500));
 
     private Task<PreviousRestartResult> RunAsync(FakeSession session) =>
         CreateGuard(session).TryRestartWithPreviousAsync(Expected, Preceding, CancellationToken.None);

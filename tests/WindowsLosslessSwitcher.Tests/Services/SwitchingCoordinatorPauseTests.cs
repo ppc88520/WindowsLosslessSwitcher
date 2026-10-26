@@ -206,26 +206,30 @@ public sealed partial class SwitchingCoordinatorTests
     }
 
     [Fact]
-    public async Task PauseSwitch_DoesNotPlayOrNavigateWhenTheUserWasAlreadyPaused()
+    public async Task PauseSwitch_DefersFormatWithoutPlayOrNavigationWhenTheUserWasAlreadyPaused()
     {
         var source = new TestTrackSource();
         var transport = new VerifiedTestTransport { IsPlaying = false };
         var endpoint = PauseEndpoint();
         await using var coordinator = CreateCoordinator(source, transport, endpoint, PauseResolver(LosslessFormat));
-        var completed = WaitForStatusAsync(coordinator, status => status.ResolverStatusText == "Switching: Format changed; playback paused");
+        var completed = WaitForStatusAsync(coordinator, IsDeferredSwitch);
 
         await coordinator.StartAsync(CreatePauseSettings(), CancellationToken.None);
         source.RaiseTrackChanged(CreateTrack());
         var status = await completed.WaitAsync(PausePathTimeout);
 
-        Assert.True(status.WasFormatChanged);
-        Assert.Equal(1, endpoint.TryApplyFormatCallCount);
+        Assert.False(status.WasFormatChanged);
+        Assert.Equal(0, endpoint.TryApplyFormatCallCount);
         Assert.False(transport.IsPlaying);
         Assert.Equal(0, transport.PauseCallCount);
         Assert.Equal(0, transport.PlayCallCount);
         Assert.Equal(0, transport.GuardedRestartCallCount);
         Assert.Equal(0, transport.SkipPreviousCallCount);
+        Assert.Empty(endpoint.MuteCalls); // an idle deferred switch must not silence other applications
     }
+
+    private static bool IsDeferredSwitch(SwitchingStatus status) =>
+        status.ResolverStatusText == "Switching: Waiting for user playback";
 
     [Fact]
     public async Task PauseSwitch_FreshIdentityMismatchBeforeApplyHoldsWithoutFormatOrPlay()

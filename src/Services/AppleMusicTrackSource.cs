@@ -10,7 +10,7 @@ using WindowsLosslessSwitcher.Models;
 
 namespace WindowsLosslessSwitcher.Services;
 
-public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportController, IPreviousTrackRestarter, ITrackIdentityVerifier
+public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportController, IPreviousTrackRestarter, ITrackIdentityVerifier, IPlaybackStateNotifier
 {
     // AUMID prefix shared by all Apple Music for Windows package identities.
     private const string AppleMusicAumidPrefix = "AppleInc.AppleMusicWin";
@@ -86,6 +86,7 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
     }
 
     public event EventHandler<TrackSnapshot>? TrackChanged;
+    public event EventHandler<MediaTransportState>? PlaybackStateChanged;
 
     public async Task StartAsync(CancellationToken cancellationToken)
     {
@@ -549,6 +550,11 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                     finalSnapshot.NavigationRevision == captured?.CapturedNavigationRevision;
                 if (result.SafeToResume && !finalMatches)
                     result = new(false, false, "Fresh final metadata did not match the original track; automatic resume is unsafe.");
+                if (result.CanRecoverOnNewTrack &&
+                    (captured is null || captured.NavigationDispatched || finalSnapshot is null ||
+                     finalSnapshot.PlaybackStatus != MediaTransportPlaybackStatus.Paused ||
+                     finalSnapshot.Position is null || finalSnapshot.Position < GuardedPreviousRestart.MinimumPosition))
+                    result = new(false, false, "Previous-unavailable recovery lost the verified paused item or dispatch certainty; automatic resume is unsafe.");
                 if (result.Restarted && finalSnapshot is { } final &&
                     (final.PlaybackStatus != MediaTransportPlaybackStatus.Paused || final.Position is null ||
                      final.Position < TimeSpan.Zero || final.Position > GuardedPreviousRestart.PositionTolerance))
@@ -581,7 +587,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
             _logger.Warn("Previous-restart: a newer properties callback started after the final read; automatic resume is unsafe.");
             result = new(false, false, "Media properties changed after the final identity check; automatic resume is unsafe.");
         }
-        _logger.Info($"Previous-restart transport result: Restarted={result.Restarted}, SafeToResume={result.SafeToResume}; {result.Detail}");
+        _logger.Info($"Previous-restart transport result: Restarted={result.Restarted}, SafeToResume={result.SafeToResume}, " +
+            $"FailureKind={result.FailureKind}, NavigationDispatched={result.NavigationDispatched}, CanRecoverOnNewTrack={result.CanRecoverOnNewTrack}; {result.Detail}");
         return result;
     }
 
@@ -701,10 +708,35 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         {
             _logger.Info($"Apple Music playback-playing callback received from {sender.SourceAppUserModelId}.");
             await RefreshSessionFromPropertiesAsync(sender, "playback-playing", publishTrackSnapshot: true, epoch);
+            PublishPlaybackStateIfCurrent(sender, epoch);
             return;
         }
 
         if (IsAttachedSession(sender, epoch)) UpdateSessionFromPlaybackInfo(sender);
+        PublishPlaybackStateIfCurrent(sender, epoch);
+    }
+
+    private void PublishPlaybackStateIfCurrent(GlobalSystemMediaTransportControlsSession session, long epoch)
+    {
+        if (!IsAttachedSession(session, epoch)) return;
+        try
+        {
+            var info = session.GetPlaybackInfo();
+            var timeline = session.GetTimelineProperties();
+            if (!IsAttachedSession(session, epoch)) return;
+            // This notification is independent of PublishSnapshot's same-track suppression.
+            // A user Play on the same paused item must wake a deferred format change.
+            PlaybackStateChanged?.Invoke(this, new MediaTransportState(
+                MapPlaybackStatus(info.PlaybackStatus),
+                info.Controls?.IsPauseEnabled == true,
+                info.Controls?.IsPlayEnabled == true,
+                timeline.Position,
+                DateTimeOffset.UtcNow));
+        }
+        catch (Exception ex)
+        {
+            _logger.Verbose($"Current Apple Music playback notification was unavailable: {ex.Message}");
+        }
     }
 
     private async Task RefreshSessionFromPropertiesAsync(
@@ -977,10 +1009,12 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
             return false;
         }
 
-        var normalized = value.Trim();
-        return normalized.Equals("Connecting…", StringComparison.OrdinalIgnoreCase) ||
-               normalized.Equals("Connecting...", StringComparison.OrdinalIgnoreCase) ||
-               normalized.Equals("Connecting", StringComparison.OrdinalIgnoreCase);
+        var normalized = value.Trim().TrimEnd('.', '…', '。').TrimEnd();
+        return normalized.Equals("Connecting", StringComparison.OrdinalIgnoreCase) ||
+               normalized.Equals("正在連線", StringComparison.Ordinal) ||
+               normalized.Equals("正在连线", StringComparison.Ordinal) ||
+               normalized.Equals("正在连接", StringComparison.Ordinal) ||
+               normalized.Equals("正在連接", StringComparison.Ordinal);
     }
 
     private void SchedulePlaceholderPublish(TrackSnapshot snapshot, long generation)

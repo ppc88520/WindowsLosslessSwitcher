@@ -22,7 +22,7 @@ The app lives in the system tray and stays out of the way. It is an independent 
 - Automatic sample-rate and optional bit-depth switching for Apple Music for Windows
 - Exact format matching against the Apple Music catalog; local files are matched to their actual file format
 - Follows the Windows default playback device, or pins a specific device
-- Mutes instantly on a track change so nothing plays at the old format, switches the device live under Apple Music's running audio stream, and unmutes once the rebuilt pipeline produces real audio — no pops, no wrong-format playback, no pause/resume games, and song endings play in full
+- Mutes the target device during format switching and unmutes once the rebuilt pipeline produces real audio
 - Verifies audio is actually flowing after every switch, with automatic recovery if Apple Music's player stalls
 - Optional popup toast when a new format is applied
 - Tray-first UI with current format display, diagnostics export, and update checks
@@ -68,13 +68,13 @@ Successful catalog matches are kept in a versioned local cache, scoped to the Ap
 2. **Local file match** — local-library files and tracks the catalog cannot identify are matched to the actual format of the file in Apple Music's cache.
 3. **Conservative fallback** — when neither layer can identify the track, the device is set to an honest 24-bit / 44.1 kHz rather than a tier-derived guess: the audio-quality tier only describes your ceiling, not the playing track's real rate, and forcing a guessed high rate would upsample everything that doesn't match it. A toast (when enabled) tells you the rate was undetermined.
 
-When a switch is needed, the app mutes the device the instant the track changes (so nothing is audible at the old format) and applies the new shared-mode format live, under Apple Music's running audio stream. Windows invalidates the stream and Apple Music rebuilds it on its own within a few seconds; once real audio is confirmed, the app unmutes. If playback ever stalls anyway, an escalating recovery (nudge → skip → as a last resort an automatic Apple Music restart) brings it back.
+With the experimental restart option off, the normal switching path mutes the device after detecting the track change and applies the new shared-mode format live, under Apple Music's running audio stream. Windows invalidates the stream and Apple Music rebuilds it; once real audio is confirmed, the app unmutes. If playback stalls, the normal recovery ladder can escalate from a nudge to a skip and, when enabled, an automatic Apple Music restart.
 
-An optional **Restart track after sample-rate changes (experimental)** setting pauses before a rate change and keeps the output device muted until the same track is confirmed back at its beginning. It is disabled by default, can take ten seconds or longer, and has stricter failure handling than normal playback recovery. See [guarded track restart](GUARDED_TRACK_RESTART.md) for the behavior, limitations, and manual test procedure.
+An optional **Restart track after sample-rate changes (experimental)** setting pauses before a rate change and keeps the output device muted until the same track is confirmed back at its beginning. It is disabled by default, waits for the user's Play if already paused, and can take ten seconds or longer. While enabled, failed audio recovery stops for manual handling instead of automatically skipping tracks or restarting Apple Music. The first manually played track may still be audible briefly before mute control is obtained; about two seconds was reported in the independent test build. See [guarded track restart](GUARDED_TRACK_RESTART.md) for the behavior, limitations, and manual test procedure.
 
 Do also note that:
 
-- A track that needs a format switch starts with a few seconds of silence — that is the mute/switch/rebuild cycle doing its job. Audio then comes in at the correct format a few seconds into the track, and its ending is not cut short. Tracks that don't need a switch start instantly.
+- Normal live format switching can leave a few seconds of silence while the pipeline rebuilds, so audio may resume partway into the track. The optional restart sequence attempts to return the intended track to its beginning afterward. Same-rate tracks do not enter that new sequence, although existing format-lookup handling can still briefly mute output.
 - Catalog matching depends on Apple's public web catalog. If Apple changes it, exact matching may degrade until the app is updated; the fallback layers keep working in the meantime.
 
 ## Settings
@@ -99,7 +99,7 @@ Settings are stored at `%APPDATA%\WindowsLosslessSwitcher\settings.json`. The ca
   "switchBitDepth": true,
 
   // Experimental: pause before a sample-rate change, then restart the same track.
-  // Includes muted preparation of at least ten seconds; unchanged-rate tracks keep normal behavior.
+  // Includes muted preparation of at least ten seconds; no new restart sequence for unchanged rates.
   "restartTrackAfterSampleRateChange": false,
 
   // Default bit depth applied when the resolved format does not specify one.
@@ -145,7 +145,7 @@ Settings are stored at `%APPDATA%\WindowsLosslessSwitcher\settings.json`. The ca
   // Last-resort recovery: when playback wedges repeatedly and every lighter recovery fails,
   // restart Apple Music automatically (its play queue may reset — Apple Music cannot restore
   // it across restarts). Disable to keep recovery limited to nudges and track skips.
-  // Also editable from the app window.
+  // Applies when the experimental restart option is off. Also editable from the app window.
   "restartAppleMusicOnPlaybackFailure": true,
 
   // Set by the app when it captures a pre-switch device format for later restoration.

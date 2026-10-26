@@ -18,6 +18,7 @@ public sealed class GuardedPreviousRestart : IPreviousTrackRestarter
     private readonly TimeSpan _pollInterval;
     private readonly TimeSpan _confirmationWindow;
     private readonly TimeSpan _deferredPlayDelay;
+    private readonly TimeSpan _previousCapabilityTimeout;
 
     public GuardedPreviousRestart(
         IPreviousRestartSession session,
@@ -25,7 +26,8 @@ public sealed class GuardedPreviousRestart : IPreviousTrackRestarter
         TimeSpan? observationTimeout = null,
         TimeSpan? pollInterval = null,
         TimeSpan? confirmationWindow = null,
-        TimeSpan? deferredPlayDelay = null)
+        TimeSpan? deferredPlayDelay = null,
+        TimeSpan? previousCapabilityTimeout = null)
     {
         _session = session;
         _logger = logger;
@@ -33,12 +35,15 @@ public sealed class GuardedPreviousRestart : IPreviousTrackRestarter
         _pollInterval = pollInterval ?? TimeSpan.FromMilliseconds(50);
         _confirmationWindow = confirmationWindow ?? TimeSpan.FromMilliseconds(500);
         _deferredPlayDelay = deferredPlayDelay ?? TimeSpan.FromMilliseconds(500);
+        _previousCapabilityTimeout = previousCapabilityTimeout ?? TimeSpan.FromSeconds(2);
         if (_observationTimeout <= TimeSpan.Zero || _pollInterval <= TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(observationTimeout));
         if (_confirmationWindow < TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(confirmationWindow));
         if (_deferredPlayDelay < TimeSpan.Zero)
             throw new ArgumentOutOfRangeException(nameof(deferredPlayDelay));
+        if (_previousCapabilityTimeout < TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(previousCapabilityTimeout));
     }
 
     public async Task<PreviousRestartResult> TryRestartWithPreviousAsync(
@@ -68,22 +73,62 @@ public sealed class GuardedPreviousRestart : IPreviousTrackRestarter
         cancellationToken.ThrowIfCancellationRequested();
         var initial = await ReadAsync(cancellationToken);
         if (initial is null || !SameTrack(initial, expectedTrack) || string.IsNullOrEmpty(initial.SessionId))
-            return Result(false, false, "preflight could not verify the expected current track; no Previous was sent.");
+            return Result(false, false, "preflight could not verify the expected current track; no Previous was sent.", navigationDispatched: false);
         Trace("preflight", initial);
         if (initial.PlaybackStatus != MediaTransportPlaybackStatus.Paused)
-            return Result(false, true, "preflight was not paused; no Previous was sent.");
+            return Result(false, true, "preflight was not paused; no Previous was sent.", navigationDispatched: false);
         if (initial.Position is null || initial.Position < MinimumPosition)
-            return Result(false, true, "position was unknown or below the 10-second guard; no Previous was sent.");
-        if (!initial.CanPrevious)
-            return Result(false, true, "Previous control was disabled; no Previous was sent.");
-
-        // Recheck immediately before dispatch. No command goes to a newly selected session/item.
-        var before = await ReadAsync(cancellationToken);
-        if (!SameOperation(before, initial) || !SameTrack(before, expectedTrack))
-            return Result(false, false, "track, session, or user navigation changed before dispatch; no Previous was sent.");
-        if (before!.PlaybackStatus != MediaTransportPlaybackStatus.Paused ||
-            before.Position is null || before.Position < MinimumPosition || !before.CanPrevious)
-            return Result(false, true, "pause, position, or Previous capability changed before dispatch; no Previous was sent.");
+            return Result(false, true, "position was unknown or below the 10-second guard; no Previous was sent.", navigationDispatched: false);
+        // A freshly paused session may briefly publish disabled transport controls. Wait
+        // on this same captured operation without playing or navigating to refresh them.
+        // One total availability window also covers capability loss at the final recheck.
+        var capabilityTimer = Stopwatch.StartNew();
+        var waitingLogged = false;
+        PreviousRestartSnapshot? before = initial;
+        var freshRead = false;
+        PreviousRestartResult CapabilityUnavailable() => Result(false, true,
+            "Previous did not become available within the verified paused-track readiness window; no navigation was dispatched. Select a new track or manually return this track to its beginning.",
+            PreviousRestartFailureKind.PreviousUnavailable, navigationDispatched: false);
+        while (true)
+        {
+            if (before is null || !SameOperation(before, initial) || !SameTrack(before, expectedTrack))
+                return Result(false, false, "track, session, or user navigation changed before dispatch; no Previous was sent.", navigationDispatched: false);
+            if (before.PlaybackStatus != MediaTransportPlaybackStatus.Paused ||
+                before.Position is null || before.Position < MinimumPosition)
+                return Result(false, true, "pause or position changed before dispatch; no Previous was sent.", navigationDispatched: false);
+            if (waitingLogged && capabilityTimer.Elapsed >= _previousCapabilityTimeout)
+                return CapabilityUnavailable();
+            if (before.CanPrevious && freshRead)
+                break;
+            if (!before.CanPrevious)
+            {
+                if (!waitingLogged)
+                {
+                    _logger.Info($"Previous-restart: Previous is unavailable; waiting up to {_previousCapabilityTimeout.TotalMilliseconds:0} ms on the same paused track without issuing playback or navigation commands.");
+                    waitingLogged = true;
+                }
+                if (capabilityTimer.Elapsed >= _previousCapabilityTimeout)
+                    return CapabilityUnavailable();
+                var remainingDelay = _previousCapabilityTimeout - capabilityTimer.Elapsed;
+                if (remainingDelay <= TimeSpan.Zero) return CapabilityUnavailable();
+                await Task.Delay(remainingDelay < _pollInterval ? remainingDelay : _pollInterval, cancellationToken);
+            }
+            if (waitingLogged)
+            {
+                var remainingRead = _previousCapabilityTimeout - capabilityTimer.Elapsed;
+                if (remainingRead <= TimeSpan.Zero) return CapabilityUnavailable();
+                try { before = await ReadAsync(cancellationToken).WaitAsync(remainingRead, cancellationToken); }
+                catch (TimeoutException)
+                {
+                    return Result(false, false, "Previous capability refresh timed out before navigation; the current item could not be freshly verified.", navigationDispatched: false);
+                }
+            }
+            else
+            {
+                before = await ReadAsync(cancellationToken);
+            }
+            freshRead = true;
+        }
 
         cancellationToken.ThrowIfCancellationRequested();
         _logger.Info("Previous-restart: dispatching one Previous request on the captured session.");
@@ -280,11 +325,14 @@ public sealed class GuardedPreviousRestart : IPreviousTrackRestarter
         initial.RepeatMode is MediaTransportRepeatMode.Off or MediaTransportRepeatMode.All &&
         current.RepeatMode is MediaTransportRepeatMode.Off or MediaTransportRepeatMode.All;
 
-    private PreviousRestartResult Result(bool restarted, bool safe, string detail)
+    private PreviousRestartResult Result(
+        bool restarted, bool safe, string detail,
+        PreviousRestartFailureKind failureKind = PreviousRestartFailureKind.Unspecified,
+        bool navigationDispatched = true)
     {
         if (restarted) _logger.Info($"Previous-restart confirmed: {detail}");
         else _logger.Warn($"Previous-restart skipped/failed: {detail} SafeToResume={safe}.");
-        return new(restarted, safe, detail);
+        return new(restarted, safe, detail, failureKind, navigationDispatched);
     }
 
     private void Trace(string stage, PreviousRestartSnapshot snapshot) =>

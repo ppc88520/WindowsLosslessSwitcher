@@ -16,6 +16,12 @@ public sealed class AppleMusicTrackSourceTests
     [InlineData("Connecting...")]
     [InlineData("Connecting")]
     [InlineData("  connecting…  ")]
+    [InlineData("正在連線...")]
+    [InlineData("正在連線…")]
+    [InlineData("  正在連線  ")]
+    [InlineData("正在连线...")]
+    [InlineData("正在连接…")]
+    [InlineData("正在連接...")]
     public void IsPlaceholderTrack_ReturnsTrueForConnectingVariants(string connectingValue)
     {
         var byTitle = CreateTrack(title: connectingValue, artist: "Real Artist");
@@ -129,8 +135,11 @@ public sealed class AppleMusicTrackSourceTests
         Assert.NotNull(received);
     }
 
-    [Fact]
-    public async Task HandleSnapshot_SuppressesPlaceholderWhenLastRealTrackExists()
+    [Theory]
+    [InlineData("Connecting…")]
+    [InlineData("正在連線...")]
+    [InlineData("正在连接…")]
+    public async Task HandleSnapshot_SuppressesPlaceholderWhenLastRealTrackExists(string placeholder)
     {
         await using var source = CreateSource(placeholderDebounce: ImmediateDebounce);
         var received = new List<string?>();
@@ -139,7 +148,7 @@ public sealed class AppleMusicTrackSourceTests
         // Establish a real track first.
         source.HandleSnapshot(CreateTrack("Real Song", "Artist"));
         // Placeholder should be suppressed — the last real track is preserved.
-        source.HandleSnapshot(CreateTrack("Connecting…", "Artist"));
+        source.HandleSnapshot(CreateTrack(placeholder, "Artist"));
 
         await Task.Delay(50);
         Assert.Equal(["Real Song"], received);

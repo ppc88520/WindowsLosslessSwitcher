@@ -1305,8 +1305,24 @@ public sealed partial class SwitchingCoordinatorTests
         public void RaiseTrackChanged(TrackSnapshot track) => TrackChanged?.Invoke(this, track);
     }
 
-    private class TestMediaTransportController : IMediaTransportController, IPreviousTrackRestarter
+    private class TestMediaTransportController : IMediaTransportController, IPreviousTrackRestarter, IPlaybackStateNotifier
     {
+        public event EventHandler<MediaTransportState>? PlaybackStateChanged;
+
+        public int PlaybackStateSubscriberCount => PlaybackStateChanged?.GetInvocationList().Length ?? 0;
+
+        public void RaisePlaybackStateChanged(MediaTransportPlaybackStatus status, bool updateState = true)
+        {
+            if (updateState) IsPlaying = status == MediaTransportPlaybackStatus.Playing;
+            PlaybackStateChanged?.Invoke(this, new(status, CanPause, CanPlay, TimelinePosition, DateTimeOffset.UtcNow));
+        }
+
+        public Action<MediaTransportState> CapturePlaybackStateChangedCallback()
+        {
+            var captured = PlaybackStateChanged;
+            return state => captured?.Invoke(this, state);
+        }
+
         public int PauseCallCount { get; private set; }
 
         public int PlayCallCount { get; private set; }
