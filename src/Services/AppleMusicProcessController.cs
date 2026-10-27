@@ -44,6 +44,50 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
         }
     }
 
+    public async Task<bool> TryOpenAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        var processes = Process.GetProcessesByName(AppleMusicProcessName);
+        try
+        {
+            // Never use the restart path for an Open action. In particular, do not close
+            // the player or terminate its media agent when a window is already running.
+            if (processes.Length != 0)
+            {
+                try
+                {
+                    // Shell activation also shows an existing packaged app's window.
+                    // A process-only check would leave a minimized/background app hidden.
+                    using var activation = Process.Start(new ProcessStartInfo
+                    {
+                        FileName = $"shell:AppsFolder\\{AppleMusicPaths.PackageFamilyName}!App",
+                        UseShellExecute = true,
+                    });
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn($"Apple Music activation failed: {ex.Message}");
+                    return false;
+                }
+            }
+        }
+        finally
+        {
+            foreach (var process in processes) process.Dispose();
+        }
+        try
+        {
+            return await RelaunchAppleMusicAsync(cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
+        catch (Exception ex)
+        {
+            _logger.Warn($"Apple Music open failed: {ex.Message}");
+            return false;
+        }
+    }
+
     private async Task CloseAppleMusicAsync()
     {
         var processes = Process.GetProcessesByName(AppleMusicProcessName);
@@ -133,8 +177,9 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
         }
     }
 
-    private async Task<bool> RelaunchAppleMusicAsync()
+    private async Task<bool> RelaunchAppleMusicAsync(CancellationToken cancellationToken = default)
     {
+        cancellationToken.ThrowIfCancellationRequested();
         using var launcher = Process.Start(new ProcessStartInfo
         {
             FileName = $"shell:AppsFolder\\{AppleMusicPaths.PackageFamilyName}!App",
@@ -157,7 +202,7 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
                 return true;
             }
 
-            await Task.Delay(ProcessPollInterval, CancellationToken.None);
+            await Task.Delay(ProcessPollInterval, cancellationToken);
         }
 
         _logger.Warn($"Apple Music did not reappear within {RelaunchAppearTimeout.TotalSeconds:0} s of relaunch.");

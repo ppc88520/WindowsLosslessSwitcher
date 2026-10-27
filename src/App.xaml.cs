@@ -36,6 +36,7 @@ public partial class App : Application
     private AppleMusicAudioMonitor? _audioMonitor;
     private string? _lastArtworkRevision;
     private System.Windows.Threading.DispatcherTimer? _artworkRecheckTimer;
+    private System.Windows.Threading.DispatcherTimer? _playbackRefreshTimer;
     private int _artworkRechecksRemaining;
     private string? _storefront;
 
@@ -54,7 +55,7 @@ public partial class App : Application
             _logger.Warn("Startup ownership: duplicate instance rejected.");
             if (!launchMinimized)
             {
-                System.Windows.MessageBox.Show(
+                LocalizedDialog.Show(
                     "Windows Lossless Switcher is already running.",
                     "Windows Lossless Switcher",
                     MessageBoxButton.OK,
@@ -69,6 +70,7 @@ public partial class App : Application
         _logger.Info($"OS version: {Environment.OSVersion.Version} ({(Environment.Is64BitOperatingSystem ? "64-bit" : "32-bit")}, {System.Runtime.InteropServices.RuntimeInformation.OSArchitecture}).");
 
         _settings = _settingsService.Load();
+        _viewModel.UiLanguage = _settings.UiLanguage;
         _logger.VerboseEnabled = _settings.EnableVerboseDiagnostics;
         _viewModel.SelectedMode = _settings.DeviceSelectionMode;
         _viewModel.SelectedDeviceId = _settings.PinnedDeviceId;
@@ -143,13 +145,14 @@ public partial class App : Application
         _audioMonitor = new AppleMusicAudioMonitor(_logger, appleMusicTrackSource);
         _storefront = catalogResolver.Storefront;
         _viewModel.SeedStorefrontInfo(catalogResolver.Storefront);
+        var processController = new AppleMusicProcessController(_logger);
         _coordinator = new SwitchingCoordinator(
             appleMusicTrackSource,
             appleMusicTrackSource,
             resolverChain,
             audioEndpointController,
             _logger,
-            new AppleMusicProcessController(_logger),
+            processController,
             formatCacheStore,
             catalogResolverForCacheVerification);
         _coordinator.StatusChanged += OnCoordinatorStatusChanged;
@@ -183,6 +186,13 @@ public partial class App : Application
             _coordinator.WaitForUserPlaybackAfterManualRestart();
         }
         await _coordinator.StartAsync(_settings, CancellationToken.None);
+        _viewModel.Playback.Configure(_coordinator, processController);
+        _playbackRefreshTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(750),
+        };
+        _playbackRefreshTimer.Tick += (_, _) => _viewModel.Playback.Refresh();
+        _playbackRefreshTimer.Start();
         if (e.Args.Contains("--manual-player-restart-failed", StringComparer.Ordinal))
             _viewModel.SetLifecycleNotice("Tool restarted; player restart not confirmed", "Check Apple Music, select a track, and press Play manually. The restart will not be retried automatically.");
         ApplyStartupRegistration();
@@ -196,6 +206,9 @@ public partial class App : Application
 
     protected override async void OnExit(ExitEventArgs e)
     {
+        _playbackRefreshTimer?.Stop();
+        _viewModel.Playback.Dispose();
+        _viewModel.DetachLocalization();
         if (_coordinator is not null)
         {
             _coordinator.StatusChanged -= OnCoordinatorStatusChanged;
@@ -233,13 +246,14 @@ public partial class App : Application
         {
             if (_manualRestartInProgress) return;
             _viewModel.UpdateStatus(status);
+            _viewModel.Playback.Refresh();
             if (_recoveryNotifications.ShouldNotify(status))
             {
                 var advice = RecoveryAdvice.From(status);
-                _trayIconHost?.ShowRecoveryNotification(advice.Title, advice.Message);
+                _trayIconHost?.ShowRecoveryNotification(LocalizationService.Current[advice.Title], LocalizationService.Current[advice.Message]);
             }
             UpdateActiveTargetCapabilities();
-            _trayIconHost?.UpdateStatus(status.ResolverStatusText);
+            _trayIconHost?.UpdateStatus(_viewModel.PhaseText);
             RefreshCurrentFormatDisplays();
             UpdateArtworkIfChanged();
             ScheduleArtworkRechecks();
@@ -255,7 +269,7 @@ public partial class App : Application
                 if (isUndetermined)
                 {
                     _trayIconHost?.UpdateStatus(
-                        $"Rate undetermined — using {AudioFormatTextFormatter.Format(status.AppliedFormat)}");
+                        LocalizationService.Current.Format("Rate undetermined — using {0}", AudioFormatTextFormatter.Format(status.AppliedFormat)));
                 }
 
                 if (_settings?.EnableSwitchToasts == true)
@@ -324,6 +338,15 @@ public partial class App : Application
     {
         if (_settings is null)
         {
+            return;
+        }
+
+        // A display-language change does not reconfigure audio or send media commands.
+        if (e.PropertyName == nameof(MainWindowViewModel.UiLanguage))
+        {
+            _settings.UiLanguage = _viewModel.UiLanguage;
+            _settingsService.Save(_settings);
+            _trayIconHost?.UpdateStatus(_viewModel.PhaseText);
             return;
         }
 
@@ -644,14 +667,15 @@ public partial class App : Application
 
     private async Task RestartManuallyAsync(ManualRestartMode mode)
     {
-        if (_manualRestartInProgress || _viewModel.IsRestartBusy || _coordinator is null) return;
+        if (_manualRestartInProgress || _viewModel.IsRestartBusy || _viewModel.Playback.IsBusy || _coordinator is null) return;
         _viewModel.IsRestartBusy = true;
+        _viewModel.Playback.SetRestartBusy(true);
         string? requestPath = null;
         try
         {
             // IsRestartBusy claims both commands during the modal loop. Ordinary status
             // updates remain visible until the user confirms, including after Cancel.
-            if (mode == ManualRestartMode.AppleMusicAndTool && System.Windows.MessageBox.Show(
+            if (mode == ManualRestartMode.AppleMusicAndTool && LocalizedDialog.Show(
                 "This will close and reopen Apple Music and Windows Lossless Switcher. The play queue may not be preserved. Select a track and press Play yourself afterward. Continue?",
                 ManualRestartHandoff.ApplicationName, MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes)
                 return;
@@ -686,6 +710,7 @@ public partial class App : Application
         finally
         {
             _viewModel.IsRestartBusy = false;
+            _viewModel.Playback.SetRestartBusy(false);
             _manualRestartInProgress = false;
         }
     }
@@ -827,7 +852,7 @@ public partial class App : Application
         {
             AddExtension = true,
             DefaultExt = ".log",
-            Filter = "Log files (*.log)|*.log|All files (*.*)|*.*",
+            Filter = LocalizationService.Current["Log files (*.log)|*.log|All files (*.*)|*.*"],
             FileName = $"windows-lossless-switcher-{DateTime.Now:yyyyMMdd-HHmmss}.log",
         };
 

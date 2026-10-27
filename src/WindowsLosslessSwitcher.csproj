@@ -61,6 +61,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Localization\*.zh-TW.json" WithCulture="false" />
     <ApplicationDefinition Remove="App.xaml" />
     <Resource Include="Assets\WLS.ico" />
     <Resource Include="Assets\Fonts\Inter-Regular.ttf" />

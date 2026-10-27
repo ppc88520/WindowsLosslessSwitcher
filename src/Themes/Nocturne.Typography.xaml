@@ -2,9 +2,9 @@
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                     xmlns:sys="clr-namespace:System;assembly=System.Runtime">
 
-  <!-- Inter 400/500 is bundled; Segoe UI Variable then Segoe UI are the fallbacks. Hierarchy in
+  <!-- Inter 400/500 is bundled; Windows UI fonts and Traditional Chinese fonts are fallbacks. Hierarchy in
        Nocturne comes from size and space, never weight above Medium. -->
-  <FontFamily x:Key="Nocturne.FontFamily">pack://application:,,,/Assets/Fonts/#Inter, Segoe UI Variable Text, Segoe UI</FontFamily>
+  <FontFamily x:Key="Nocturne.FontFamily">pack://application:,,,/Assets/Fonts/#Inter, Segoe UI Variable Text, Segoe UI, Microsoft JhengHei UI, Microsoft JhengHei</FontFamily>
   <FontFamily x:Key="Nocturne.FontFamily.Mono">Cascadia Mono, Consolas</FontFamily>
 
   <sys:Double x:Key="Nocturne.FontSize.Kicker">10</sys:Double>

@@ -206,7 +206,11 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 controls?.IsPauseEnabled ?? false,
                 controls?.IsPlayEnabled ?? false,
                 timeline.Position,
-                DateTimeOffset.UtcNow);
+                DateTimeOffset.UtcNow)
+            {
+                CanNext = controls?.IsNextEnabled == true,
+                CanPrevious = controls?.IsPreviousEnabled == true,
+            };
         }
         catch
         {
@@ -731,7 +735,11 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 info.Controls?.IsPauseEnabled == true,
                 info.Controls?.IsPlayEnabled == true,
                 timeline.Position,
-                DateTimeOffset.UtcNow));
+                DateTimeOffset.UtcNow)
+            {
+                CanNext = info.Controls?.IsNextEnabled == true,
+                CanPrevious = info.Controls?.IsPreviousEnabled == true,
+            });
         }
         catch (Exception ex)
         {

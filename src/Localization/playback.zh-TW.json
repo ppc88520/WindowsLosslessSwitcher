@@ -1,0 +1,17 @@
+{
+  "Play": "播放",
+  "Pause": "暫停",
+  "Apple Music is not connected.": "尚未連線至 Apple Music。",
+  "Playback controls are temporarily unavailable.": "正在處理播放作業，控制項暫時無法使用。",
+  "Playback is held for safety. Follow the recovery guidance.": "播放目前受安全保護限制，請依恢復提示處理。",
+  "Playback controls are unavailable during restart.": "重新啟動期間無法使用播放控制項。",
+  "Apple Music does not currently support this control.": "Apple Music 目前無法使用這項控制。",
+  "Apple Music did not accept this command.": "Apple Music 未接受這項操作。",
+  "Command sent to Apple Music.": "已將操作送至 Apple Music。",
+  "Playback command timed out. Pause Apple Music and restart the tool.": "播放操作逾時。請先暫停 Apple Music，再重新啟動工具。",
+  "Pause could not be confirmed. Follow the recovery guidance.": "無法確認播放已暫停，請依恢復提示處理。",
+  "Playback paused.": "播放已暫停。",
+  "Apple Music opened.": "Apple Music 已開啟。",
+  "Could not open Apple Music.": "無法開啟 Apple Music。",
+  "Playback control failed. Check the recovery guidance.": "播放控制失敗，請查看恢復提示。"
+}

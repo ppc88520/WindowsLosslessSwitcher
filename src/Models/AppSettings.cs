@@ -16,10 +16,21 @@ public enum DeviceSelectionMode
 /// </summary>
 public sealed class AppSettings
 {
+    private string _uiLanguage = "en";
     private int _defaultBitDepth = 24;
     private int _formatCacheRefreshDays = 30;
     private List<int> _allowedSampleRates = [];
     private List<int> _allowedBitDepths = [];
+
+    /// <summary>Display language only; does not change the Apple Music storefront or numeric culture.</summary>
+    public string UiLanguage
+    {
+        get => _uiLanguage;
+        set => _uiLanguage = NormalizeUiLanguage(value);
+    }
+
+    public static string NormalizeUiLanguage(string? language) =>
+        string.Equals(language?.Trim(), "zh-TW", StringComparison.OrdinalIgnoreCase) ? "zh-TW" : "en";
 
     public DeviceSelectionMode DeviceSelectionMode { get; set; } = DeviceSelectionMode.FollowDefault;
 

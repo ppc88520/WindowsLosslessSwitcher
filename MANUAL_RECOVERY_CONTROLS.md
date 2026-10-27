@@ -1,6 +1,8 @@
 # Manual recovery controls
 
-The main window and tray flyout provide **Restart Tool** and **Restart Apple Music and Tool**. The labels are English and have no ellipsis. These controls are available independently of the experimental track-restart setting.
+The main window and tray flyout provide **Restart Tool** and **Restart Apple Music and Tool**. These are the English labels, without an ellipsis; the optional Traditional Chinese interface translates them. Both actions are available independently of the experimental track-restart setting, whose default remains off.
+
+The same surfaces share Play/Pause, Previous, Next, and Open Apple Music commands. See [playback controls and localization](PLAYBACK_CONTROLS_AND_LOCALIZATION.md) for their usage, capability checks, language selection, and recovery boundaries.
 
 ## Failure guidance
 
@@ -20,8 +22,8 @@ The advice remains visible in the main window and tray flyout. A non-blocking tr
 
 ## Restart sequence
 
-1. Claim both UI commands so repeated clicks cannot schedule multiple handoffs. Cancelling the combined-restart confirmation does not stop processing or issue media commands.
-2. Suspend new work, cancel superseded work, and acquire the switching barrier. Confirm Apple Music is Paused, Stopped, or Closed, or positively establish that the player is absent. A rejected, unknown, cancelled, or unconfirmed pause does not authorize shutdown.
+1. Claim both restart commands and disable conflicting playback controls so repeated clicks cannot schedule multiple handoffs. A playback action already in progress, including opening the player, prevents a restart from starting. Cancelling the combined-restart confirmation does not stop processing or issue media commands.
+2. Suspend new work, cancel superseded work, and acquire the switching barrier. Check that no earlier playback command remains unresolved, then confirm Apple Music is Paused, Stopped, or Closed, or positively establish that the player is absent. A rejected, unknown, cancelled, or unconfirmed pause does not authorize shutdown. A Paused snapshot also cannot authorize shutdown while an earlier Play may still execute.
 3. Start a helper using the current application executable. Validate the request's profile, path, nonce, age, parent PID/start time, and parent executable. Publish readiness only after closing the ready-file writer.
 4. Recheck the pause after the helper becomes ready. Explicitly await coordinator cleanup before WPF shutdown releases the instance lock and owned mute.
 5. The helper waits for the old process to exit, up to 30 seconds. It does not kill an unresponsive switcher or launch a second controller while the old one remains alive.
@@ -30,13 +32,19 @@ The advice remains visible in the main window and tray flyout. A non-blocking tr
 
 An uncertain player-restart timeout does not authorize launching the tool on top of a potentially pending remote operation. A definite player-restart failure can reopen the tool with a failure notice. Startup that cannot confirm a safe pause shows manual instructions without starting automatic switching.
 
+## Pending commands and user pause
+
+The coordinator distinguishes a completed local wait from an observed playback effect. An accepted Play stays pending until Playing is observed; cancellation or timeout can leave the remote result uncertain. Command bookkeeping uses a lock and generation checks, so an older Paused read cannot erase a newer Play request, including when the expected state later has the same enum value.
+
+A user Pause cancels old processing and prevents its automatic Play or mute cleanup from overriding the user's action. It releases the tool's owned mute only after a stable pause and the absence of unresolved commands are confirmed. Successful cancellation is shown as a non-busy paused state, preserving the current track and actual device format. If an earlier command may still execute, Pause and restart preparation refuse a safe handoff, retain protection, and show manual instructions. They do not issue extra Play, Pause, or navigation commands merely to make an uncertain result appear settled.
+
 ## Limitations and validation
 
 Restarting Apple Music can lose its playback queue and position. Restarting the tool only rebuilds its own state and session connections; it cannot guarantee repair of a player renderer or unsupported device format. Already accepted remote operations cannot be withdrawn. A fully frozen UI may prevent both sets of buttons from working; this feature does not add a resident external watchdog.
 
-The current contribution passed a local Windows x64 Release solution build with **0 warnings and 0 errors**, focused tests with **62 passed, 0 failed, 0 skipped**, and the full Release suite with **448 passed, 0 failed, 0 skipped** in approximately **13 min 24 sec**, using .NET SDK **8.0.426**. The main window and tray flyout were also rendered offline with fake data.
+Formal-source local Release validation: **516 tests passed**, using .NET SDK **8.0.426** on Windows x64. Coverage includes readiness handoff, control/restart mutual exclusion, confirmed user pause, delayed Play and cancellation, stale-reader races, and both language settings.
 
-Tests use fake playback/process operations, plus temporary-file validation for the readiness handoff. Offline WPF rendering checks layout with fake data; it does not launch the switcher, change DAC formats, or operate Apple Music. The exact contribution build still needs manual exit/relaunch, queue, notification, and audible-output validation. Earlier independent-build tests and pause0.4 hardware observations are separate evidence.
+Tests use fake playback/process operations, plus temporary-file validation for the readiness handoff. The formal source passed 79 focused tests and 32 offline WPF renders, with live language switching, zero binding errors, and verified scrolling to the restart controls. Rendering uses fake data; it does not launch the switcher, change DAC formats, or operate Apple Music. A separate isolated bilingual/controls derivative completed 503 tests and 32 offline UI renders and received limited positive user feedback. That feedback does not close every restart, queue, notification, idle-resume, or audible-output check for the precise formal source. Earlier independent-build observations remain separate evidence, and local passes are not a claim of GitHub CI success.
 
 | Manual check | Expected result |
 | --- | --- |
@@ -48,3 +56,6 @@ Tests use fake playback/process operations, plus temporary-file validation for t
 | Old process does not exit | Helper stops without killing it or launching another copy |
 | Restart with the experimental option off | Format unchanged until Play; option remains off |
 | Repeated failure callbacks | One notification per track/category and persistent advice |
+| Playback or Open action already running | Restart cannot overlap it; no duplicate launch or transport operation |
+| Earlier Play is pending or its result is uncertain | Pause/restart does not release mute or start a helper based on a stale Paused snapshot |
+| User Pause cancels resolution | Stable pause is non-busy; track and current format remain visible; later Play starts fresh handling |

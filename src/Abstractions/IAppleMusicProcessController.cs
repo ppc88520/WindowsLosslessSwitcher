@@ -7,6 +7,9 @@ namespace WindowsLosslessSwitcher.Abstractions;
 /// </summary>
 public interface IAppleMusicProcessController
 {
+    /// <summary>Opens Apple Music without closing an existing player or changing its queue.</summary>
+    Task<bool> TryOpenAsync(CancellationToken cancellationToken) => Task.FromResult(false);
+
     /// <summary>
     /// Gracefully closes and relaunches Apple Music. Returns true once the relaunched process is
     /// running; the caller is responsible for waiting for the media session and resuming playback.

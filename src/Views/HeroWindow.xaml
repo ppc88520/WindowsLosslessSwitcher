@@ -1,222 +1,185 @@
-<controls:NocturneWindow x:Class="WindowsLosslessSwitcher.Views.HeroWindow"
-                         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
-                         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-                         xmlns:controls="clr-namespace:WindowsLosslessSwitcher.Controls"
-                         xmlns:converters="clr-namespace:WindowsLosslessSwitcher.Converters"
-                         xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework"
-                         Title="Windows Lossless Switcher"
-                         Width="400"
-                         Background="{StaticResource Nocturne.Brush.Ground}"
-                         FontFamily="{StaticResource Nocturne.FontFamily}"
-                         Foreground="{StaticResource Nocturne.Brush.Text}"
-                         ResizeMode="CanMinimize"
-                         ShowInTaskbar="True"
-                         SizeToContent="Height"
-                         TextOptions.TextFormattingMode="Display"
-                         WindowStartupLocation="CenterScreen">
+<controls:NocturneWindow x:Class="WindowsLosslessSwitcher.Views.HeroWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" xmlns:controls="clr-namespace:WindowsLosslessSwitcher.Controls" xmlns:converters="clr-namespace:WindowsLosslessSwitcher.Converters" xmlns:shell="clr-namespace:System.Windows.Shell;assembly=PresentationFramework" Title="Windows Lossless Switcher" Width="400" Background="{StaticResource Nocturne.Brush.Ground}" FontFamily="{StaticResource Nocturne.FontFamily}" Foreground="{StaticResource Nocturne.Brush.Text}" ResizeMode="CanMinimize" ShowInTaskbar="True" SizeToContent="Height" TextOptions.TextFormattingMode="Display" WindowStartupLocation="CenterScreen" xmlns:services="clr-namespace:WindowsLosslessSwitcher.Services">
   <controls:NocturneWindow.Resources>
     <BooleanToVisibilityConverter x:Key="BoolToVisibility" />
   </controls:NocturneWindow.Resources>
   <Border BorderBrush="{StaticResource Nocturne.Brush.Ring}" BorderThickness="1">
     <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-    <StackPanel>
-
-      <!-- Title bar (42px drag region) -->
-      <Grid Height="42">
-        <StackPanel Margin="16,0,0,0"
-                    VerticalAlignment="Center"
-                    Orientation="Horizontal">
-          <controls:MiniSpectrograph x:Name="TitleBarSpectrograph"
-                                     Width="22"
-                                     Height="15" />
-          <TextBlock Margin="9,0,0,0"
-                     VerticalAlignment="Center"
-                     controls:Tracking.Text="WINDOWS LOSSLESS SWITCHER"
-                     FontSize="10.5"
-                     Foreground="{StaticResource Nocturne.Brush.Text45}" />
+      <StackPanel>
+        <!-- Title bar (42px drag region) -->
+        <Grid Height="42">
+          <StackPanel Margin="16,0,0,0" VerticalAlignment="Center" Orientation="Horizontal">
+            <controls:MiniSpectrograph x:Name="TitleBarSpectrograph" Width="22" Height="15" />
+            <TextBlock Margin="9,0,0,0" VerticalAlignment="Center" controls:Tracking.Text="WINDOWS LOSSLESS SWITCHER" FontSize="10.5" Foreground="{StaticResource Nocturne.Brush.Text45}" />
+          </StackPanel>
+          <StackPanel Margin="0,0,6,0" HorizontalAlignment="Right" VerticalAlignment="Center" Orientation="Horizontal" shell:WindowChrome.IsHitTestVisibleInChrome="True">
+            <Button Click="MinimizeButton_OnClick" Style="{StaticResource Nocturne.CaptionButton}">
+              <AutomationProperties.Name>
+                <Binding Path="[Minimize]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </AutomationProperties.Name>
+              <Button.ToolTip>
+                <Binding Path="[Minimize]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </Button.ToolTip>
+              <controls:NocturneIcon Width="13" Height="13" Geometry="{StaticResource Nocturne.Icon.Minus}" />
+            </Button>
+            <Button Click="CloseButton_OnClick" Style="{StaticResource Nocturne.CaptionButton.Close}">
+              <AutomationProperties.Name>
+                <Binding Path="[Close window]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </AutomationProperties.Name>
+              <Button.ToolTip>
+                <Binding Path="[Close window]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </Button.ToolTip>
+              <controls:NocturneIcon Width="13" Height="13" Geometry="{StaticResource Nocturne.Icon.X}" />
+            </Button>
+          </StackPanel>
+        </Grid>
+        <!-- Hero -->
+        <StackPanel Margin="28,20,28,24">
+          <!-- Artwork 176×176 with hue glow -->
+          <Border Width="176" Height="176" HorizontalAlignment="Center" CornerRadius="8">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Offset="0" Color="{Binding ArtworkGlowColor}" />
+                <GradientStop Offset="1" Color="#FF1B1D2B" />
+              </LinearGradientBrush>
+            </Border.Background>
+            <Border.Effect>
+              <DropShadowEffect BlurRadius="60" Direction="270" Opacity="0.55" ShadowDepth="14" Color="{Binding ArtworkGlowColor}" />
+            </Border.Effect>
+            <Grid>
+              <controls:NocturneIcon Width="34" Height="34" HorizontalAlignment="Center" VerticalAlignment="Center" Foreground="{StaticResource Nocturne.Brush.White55}" Geometry="{StaticResource Nocturne.Icon.MusicNotes}" />
+              <Border CornerRadius="8" Visibility="{Binding HasArtwork, Converter={StaticResource BoolToVisibility}}">
+                <Border.Background>
+                  <ImageBrush ImageSource="{Binding ArtworkImage}" Stretch="UniformToFill" />
+                </Border.Background>
+              </Border>
+            </Grid>
+          </Border>
+          <TextBlock Margin="0,18,0,0" HorizontalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.HeroTitle}" FontWeight="Medium" Text="{Binding TrackTitleText}" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
+          <TextBlock Margin="0,3,0,0" HorizontalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.Control}" Foreground="{StaticResource Nocturne.Brush.Text55}" Text="{Binding TrackMetaText}" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
+          <StackPanel Margin="0,16,0,0">
+            <UniformGrid Columns="3">
+              <Button Margin="0,0,4,0" MinHeight="36" Command="{Binding Playback.PreviousTrackCommand}" Style="{StaticResource Nocturne.Button.Ghost}">
+                <Button.Content>
+                  <Binding Path="[Previous]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                </Button.Content>
+                <Button.ToolTip>
+                  <Binding Path="[Previous track]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                </Button.ToolTip>
+                <AutomationProperties.Name>
+                  <Binding Path="[Previous track]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                </AutomationProperties.Name>
+              </Button>
+              <Button Margin="2,0" MinHeight="36" Command="{Binding Playback.TogglePlaybackCommand}" Content="{Binding Playback.PlayPauseText}" ToolTip="{Binding Playback.PlayPauseText}" AutomationProperties.Name="{Binding Playback.PlayPauseText}" Style="{StaticResource Nocturne.Button.Primary}" />
+              <Button Margin="4,0,0,0" MinHeight="36" Command="{Binding Playback.NextTrackCommand}" Style="{StaticResource Nocturne.Button.Ghost}">
+                <Button.Content>
+                  <Binding Path="[Next]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                </Button.Content>
+                <Button.ToolTip>
+                  <Binding Path="[Next track]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                </Button.ToolTip>
+                <AutomationProperties.Name>
+                  <Binding Path="[Next track]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                </AutomationProperties.Name>
+              </Button>
+            </UniformGrid>
+            <Button Margin="0,6,0,0" MinHeight="34" Command="{Binding Playback.OpenAppleMusicCommand}" Style="{StaticResource Nocturne.Button.Ghost}">
+              <Button.Content>
+                <Binding Path="[Open Apple Music]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </Button.Content>
+              <AutomationProperties.Name>
+                <Binding Path="[Open Apple Music]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </AutomationProperties.Name>
+            </Button>
+            <TextBlock Margin="0,7,0,0" FontSize="{StaticResource Nocturne.FontSize.Note}" Foreground="{StaticResource Nocturne.Brush.Text55}" Text="{Binding Playback.StatusText}" TextWrapping="Wrap" TextAlignment="Center" />
+          </StackPanel>
+          <TextBlock Margin="0,18,0,0" HorizontalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.ReadoutHero}" FontWeight="Medium" Foreground="{StaticResource Nocturne.Brush.AccentLight}" Text="{Binding AppliedFormatDisplayText}" />
+          <TextBlock Margin="0,4,0,0" HorizontalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.Note}" Foreground="{StaticResource Nocturne.Brush.Text35}" Text="{Binding WasLine}" />
+          <Grid Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="Auto" />
+              <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Ellipse VerticalAlignment="Center" Style="{StaticResource Nocturne.StatusDot}" />
+            <TextBlock Grid.Column="1" Margin="7,0,0,0" VerticalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.Secondary}" Foreground="{StaticResource Nocturne.Brush.Text70}" Text="{Binding PhaseText}" TextWrapping="Wrap" />
+          </Grid>
         </StackPanel>
-        <StackPanel Margin="0,0,6,0"
-                    HorizontalAlignment="Right"
-                    VerticalAlignment="Center"
-                    Orientation="Horizontal"
-                    shell:WindowChrome.IsHitTestVisibleInChrome="True">
-          <Button Click="MinimizeButton_OnClick" Style="{StaticResource Nocturne.CaptionButton}">
-            <controls:NocturneIcon Width="13"
-                                   Height="13"
-                                   Geometry="{StaticResource Nocturne.Icon.Minus}" />
-          </Button>
-          <Button Click="CloseButton_OnClick" Style="{StaticResource Nocturne.CaptionButton.Close}">
-            <controls:NocturneIcon Width="13"
-                                   Height="13"
-                                   Geometry="{StaticResource Nocturne.Icon.X}" />
-          </Button>
-        </StackPanel>
-      </Grid>
-
-      <!-- Hero -->
-      <StackPanel Margin="28,20,28,24">
-
-        <!-- Artwork 176×176 with hue glow -->
-        <Border Width="176"
-                Height="176"
-                HorizontalAlignment="Center"
-                CornerRadius="8">
-          <Border.Background>
-            <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
-              <GradientStop Offset="0" Color="{Binding ArtworkGlowColor}" />
-              <GradientStop Offset="1" Color="#FF1B1D2B" />
-            </LinearGradientBrush>
-          </Border.Background>
-          <Border.Effect>
-            <DropShadowEffect BlurRadius="60"
-                              Direction="270"
-                              Opacity="0.55"
-                              ShadowDepth="14"
-                              Color="{Binding ArtworkGlowColor}" />
-          </Border.Effect>
-          <Grid>
-            <controls:NocturneIcon Width="34"
-                                   Height="34"
-                                   HorizontalAlignment="Center"
-                                   VerticalAlignment="Center"
-                                   Foreground="{StaticResource Nocturne.Brush.White55}"
-                                   Geometry="{StaticResource Nocturne.Icon.MusicNotes}" />
-            <Border CornerRadius="8" Visibility="{Binding HasArtwork, Converter={StaticResource BoolToVisibility}}">
-              <Border.Background>
-                <ImageBrush ImageSource="{Binding ArtworkImage}" Stretch="UniformToFill" />
-              </Border.Background>
+        <Control Style="{StaticResource Nocturne.Divider}" />
+        <!-- Lower panel -->
+        <StackPanel Margin="28,16,28,22">
+          <Grid Margin="0,6,0,6">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <StackPanel Grid.Column="0">
+              <TextBlock Style="{StaticResource Nocturne.Kicker}">
+                <controls:Tracking.Text>
+                  <Binding Path="[OUTPUT DEVICE]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                </controls:Tracking.Text>
+              </TextBlock>
+              <TextBlock Margin="0,3,0,0" FontSize="{StaticResource Nocturne.FontSize.Body}" Text="{Binding ActiveTargetDeviceNameText}" TextTrimming="CharacterEllipsis" />
+            </StackPanel>
+            <Border Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center" Background="{StaticResource Nocturne.Brush.Hover}" BorderBrush="{StaticResource Nocturne.Brush.Ring}" BorderThickness="1" CornerRadius="6" Padding="9,3">
+              <TextBlock FontSize="{StaticResource Nocturne.FontSize.Small}" Foreground="{StaticResource Nocturne.Brush.Text55}" Text="{Binding DeviceModeChipText}" />
             </Border>
           </Grid>
-        </Border>
-
-        <TextBlock Margin="0,18,0,0"
-                   HorizontalAlignment="Center"
-                   FontSize="{StaticResource Nocturne.FontSize.HeroTitle}"
-                   FontWeight="Medium"
-                   Text="{Binding TrackTitleText}"
-                   TextAlignment="Center"
-                   TextTrimming="CharacterEllipsis" />
-        <TextBlock Margin="0,3,0,0"
-                   HorizontalAlignment="Center"
-                   FontSize="{StaticResource Nocturne.FontSize.Control}"
-                   Foreground="{StaticResource Nocturne.Brush.Text55}"
-                   Text="{Binding TrackMetaText}"
-                   TextAlignment="Center"
-                   TextTrimming="CharacterEllipsis" />
-        <TextBlock Margin="0,18,0,0"
-                   HorizontalAlignment="Center"
-                   FontSize="{StaticResource Nocturne.FontSize.ReadoutHero}"
-                   FontWeight="Medium"
-                   Foreground="{StaticResource Nocturne.Brush.AccentLight}"
-                   Text="{Binding AppliedFormatDisplayText}" />
-        <TextBlock Margin="0,4,0,0"
-                   HorizontalAlignment="Center"
-                   FontSize="{StaticResource Nocturne.FontSize.Note}"
-                   Foreground="{StaticResource Nocturne.Brush.Text35}"
-                   Text="{Binding WasLine}" />
-        <StackPanel Margin="0,12,0,0"
-                    HorizontalAlignment="Center"
-                    Orientation="Horizontal">
-          <Ellipse VerticalAlignment="Center" Style="{StaticResource Nocturne.StatusDot}" />
-          <TextBlock Margin="7,0,0,0"
-                     VerticalAlignment="Center"
-                     FontSize="{StaticResource Nocturne.FontSize.Secondary}"
-                     Foreground="{StaticResource Nocturne.Brush.Text70}"
-                     Text="{Binding PhaseText}" />
+          <Grid Margin="0,9,0,9">
+            <TextBlock VerticalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.Body}" TextWrapping="Wrap">
+              <TextBlock.Text>
+                <Binding Path="[Switch bit depth too]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </TextBlock.Text>
+            </TextBlock>
+            <ToggleButton HorizontalAlignment="Right" VerticalAlignment="Center" IsChecked="{Binding SwitchBitDepth}" Style="{StaticResource Nocturne.ToggleSwitch}" />
+          </Grid>
+          <Grid Margin="0,9,0,9">
+            <TextBlock VerticalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.Body}" TextWrapping="Wrap">
+              <TextBlock.Text>
+                <Binding Path="[Popup when format changes]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </TextBlock.Text>
+            </TextBlock>
+            <ToggleButton HorizontalAlignment="Right" VerticalAlignment="Center" IsChecked="{Binding EnableSwitchToasts}" Style="{StaticResource Nocturne.ToggleSwitch}" />
+          </Grid>
+          <StackPanel Margin="0,12,0,0">
+            <Border Padding="10" CornerRadius="8" BorderBrush="{StaticResource Nocturne.Brush.Ring}" BorderThickness="1" Visibility="{Binding HasRecoveryAdvice, Converter={StaticResource BoolToVisibility}}">
+              <StackPanel>
+                <TextBlock Text="{Binding RecoveryTitle}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                <TextBlock Margin="0,6,0,0" Text="{Binding RecoveryMessage}" TextWrapping="Wrap" Foreground="{StaticResource Nocturne.Brush.Text75}" />
+              </StackPanel>
+            </Border>
+            <Button Margin="0,8,0,0" Padding="12,8" Command="{Binding RestartToolCommand}" Style="{StaticResource Nocturne.Button.Ghost}">
+              <Button.Content>
+                <Binding Path="[Restart Tool]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </Button.Content>
+            </Button>
+            <Button Margin="0,6,0,0" Padding="12,8" Command="{Binding RestartPlayerAndToolCommand}" Style="{StaticResource Nocturne.Button.Ghost}">
+              <Button.Content>
+                <Binding Path="[Restart Apple Music and Tool]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </Button.Content>
+            </Button>
+          </StackPanel>
+          <Grid Margin="0,14,0,0">
+            <Grid.ColumnDefinitions>
+              <ColumnDefinition Width="*" />
+              <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+            <Button Grid.Column="0" Command="{Binding OpenAllSettingsCommand}" Padding="14,8" Style="{StaticResource Nocturne.Button.Primary}">
+              <Button.Content>
+                <Binding Path="[All settings]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+              </Button.Content>
+            </Button>
+            <Button Grid.Column="1" Margin="8,0,0,0" Command="{Binding ExportDiagnosticsCommand}" Padding="12,8" Style="{StaticResource Nocturne.Button.Ghost}">
+              <StackPanel Orientation="Horizontal">
+                <controls:NocturneIcon Width="14" Height="14" VerticalAlignment="Center" Foreground="{StaticResource Nocturne.Brush.Text70}" Geometry="{StaticResource Nocturne.Icon.Export}" />
+                <TextBlock Margin="6,0,0,0" VerticalAlignment="Center" TextWrapping="Wrap">
+                  <TextBlock.Text>
+                    <Binding Path="[Diagnostics]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+                  </TextBlock.Text>
+                </TextBlock>
+              </StackPanel>
+            </Button>
+          </Grid>
         </StackPanel>
       </StackPanel>
-
-      <Control Style="{StaticResource Nocturne.Divider}" />
-
-      <!-- Lower panel -->
-      <StackPanel Margin="28,16,28,22">
-        <Grid Margin="0,6,0,6">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="Auto" />
-          </Grid.ColumnDefinitions>
-          <StackPanel Grid.Column="0">
-            <TextBlock controls:Tracking.Text="OUTPUT DEVICE" Style="{StaticResource Nocturne.Kicker}" />
-            <TextBlock Margin="0,3,0,0"
-                       FontSize="{StaticResource Nocturne.FontSize.Body}"
-                       Text="{Binding ActiveTargetDeviceNameText}"
-                       TextTrimming="CharacterEllipsis" />
-          </StackPanel>
-          <Border Grid.Column="1"
-                  Margin="12,0,0,0"
-                  VerticalAlignment="Center"
-                  Background="{StaticResource Nocturne.Brush.Hover}"
-                  BorderBrush="{StaticResource Nocturne.Brush.Ring}"
-                  BorderThickness="1"
-                  CornerRadius="6"
-                  Padding="9,3">
-            <TextBlock FontSize="{StaticResource Nocturne.FontSize.Small}"
-                       Foreground="{StaticResource Nocturne.Brush.Text55}"
-                       Text="{Binding DeviceModeChipText}" />
-          </Border>
-        </Grid>
-
-        <Grid Margin="0,9,0,9">
-          <TextBlock VerticalAlignment="Center"
-                     FontSize="{StaticResource Nocturne.FontSize.Body}"
-                     Text="Switch bit depth too" />
-          <ToggleButton HorizontalAlignment="Right"
-                        VerticalAlignment="Center"
-                        IsChecked="{Binding SwitchBitDepth}"
-                        Style="{StaticResource Nocturne.ToggleSwitch}" />
-        </Grid>
-        <Grid Margin="0,9,0,9">
-          <TextBlock VerticalAlignment="Center"
-                     FontSize="{StaticResource Nocturne.FontSize.Body}"
-                     Text="Popup when format changes" />
-          <ToggleButton HorizontalAlignment="Right"
-                        VerticalAlignment="Center"
-                        IsChecked="{Binding EnableSwitchToasts}"
-                        Style="{StaticResource Nocturne.ToggleSwitch}" />
-        </Grid>
-
-
-      <StackPanel Margin="0,12,0,0">
-        <Border Padding="10" CornerRadius="8" BorderBrush="{StaticResource Nocturne.Brush.Ring}" BorderThickness="1"
-                Visibility="{Binding HasRecoveryAdvice, Converter={StaticResource BoolToVisibility}}">
-          <StackPanel>
-            <TextBlock Text="{Binding RecoveryTitle}" FontWeight="SemiBold" TextWrapping="Wrap" />
-            <TextBlock Margin="0,6,0,0" Text="{Binding RecoveryMessage}" TextWrapping="Wrap" Foreground="{StaticResource Nocturne.Brush.Text75}" />
-          </StackPanel>
-        </Border>
-        <Button Margin="0,8,0,0" Padding="12,8" Content="Restart Tool" Command="{Binding RestartToolCommand}" Style="{StaticResource Nocturne.Button.Ghost}" />
-        <Button Margin="0,6,0,0" Padding="12,8" Content="Restart Apple Music and Tool" Command="{Binding RestartPlayerAndToolCommand}" Style="{StaticResource Nocturne.Button.Ghost}" />
-      </StackPanel>
-        <Grid Margin="0,14,0,0">
-          <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="*" />
-            <ColumnDefinition Width="Auto" />
-          </Grid.ColumnDefinitions>
-          <Button Grid.Column="0"
-                  Command="{Binding OpenAllSettingsCommand}"
-                  Content="All settings"
-                  Padding="14,8"
-                  Style="{StaticResource Nocturne.Button.Primary}" />
-          <Button Grid.Column="1"
-                  Margin="8,0,0,0"
-                  Command="{Binding ExportDiagnosticsCommand}"
-                  Padding="12,8"
-                  Style="{StaticResource Nocturne.Button.Ghost}">
-            <StackPanel Orientation="Horizontal">
-              <controls:NocturneIcon Width="14"
-                                     Height="14"
-                                     VerticalAlignment="Center"
-                                     Foreground="{StaticResource Nocturne.Brush.Text70}"
-                                     Geometry="{StaticResource Nocturne.Icon.Export}" />
-              <TextBlock Margin="6,0,0,0"
-                         VerticalAlignment="Center"
-                         Text="Diagnostics" />
-            </StackPanel>
-          </Button>
-        </Grid>
-      </StackPanel>
-
-    </StackPanel>
     </ScrollViewer>
   </Border>
 </controls:NocturneWindow>

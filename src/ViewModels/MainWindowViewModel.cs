@@ -14,6 +14,23 @@ namespace WindowsLosslessSwitcher.ViewModels;
 public sealed class MainWindowViewModel : INotifyPropertyChanged
 {
     private static readonly int[] SupportedDefaultBitDepths = [16, 24];
+    private readonly LocalizationService _localization;
+    private Services.SwitchingStatus? _lastStatus;
+    private bool _hasNamedActiveDevice;
+
+    public PlaybackControlsViewModel Playback { get; } = new();
+
+    public IReadOnlyList<UiLanguageOption> UiLanguageOptions { get; } =
+    [
+        new("en", "English"),
+        new("zh-TW", "繁體中文"),
+    ];
+
+    public string UiLanguage
+    {
+        get => _localization.Language;
+        set => _localization.SetLanguage(value);
+    }
 
     private DeviceSelectionMode _selectedMode;
     private string? _selectedDeviceId;
@@ -86,8 +103,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         }
     }
     public bool HasRecoveryAdvice { get => _hasRecoveryAdvice; private set => SetField(ref _hasRecoveryAdvice, value); }
-    public string RecoveryTitle { get => _recoveryTitle; private set => SetField(ref _recoveryTitle, value); }
-    public string RecoveryMessage { get => _recoveryMessage; private set => SetField(ref _recoveryMessage, value); }
+    public string RecoveryTitle { get => _localization[_recoveryTitle]; private set => SetField(ref _recoveryTitle, value); }
+    public string RecoveryMessage { get => _localization[_recoveryMessage]; private set => SetField(ref _recoveryMessage, value); }
     public RelayCommand RestartToolCommand { get; }
     public RelayCommand RestartPlayerAndToolCommand { get; }
     public event Action? RestartToolRequested;
@@ -103,10 +120,17 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         IsBusyPhase = false;
     }
 
-    public MainWindowViewModel()
+    public MainWindowViewModel() : this(LocalizationService.Current)
     {
-        RestartToolCommand = new RelayCommand(() => RestartToolRequested?.Invoke(), () => !IsRestartBusy);
-        RestartPlayerAndToolCommand = new RelayCommand(() => RestartPlayerAndToolRequested?.Invoke(), () => !IsRestartBusy);
+    }
+
+    public MainWindowViewModel(LocalizationService localization)
+    {
+        _localization = localization;
+        _localization.LanguageChanged += OnLanguageChanged;
+        RestartToolCommand = new RelayCommand(() => RestartToolRequested?.Invoke(), () => !IsRestartBusy && !Playback.IsBusy);
+        RestartPlayerAndToolCommand = new RelayCommand(() => RestartPlayerAndToolRequested?.Invoke(), () => !IsRestartBusy && !Playback.IsBusy);
+        Playback.PropertyChanged += OnPlaybackPropertyChanged;
         RefreshDevicesCommand = new RelayCommand(() => RefreshRequested?.Invoke());
         ExportDiagnosticsCommand = new RelayCommand(() => ExportDiagnosticsRequested?.Invoke());
         RestoreOriginalFormatCommand = new RelayCommand(
@@ -155,10 +179,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public ObservableCollection<FormatOptionItem> BitDepthOptions { get; } = [];
 
-    public IReadOnlyList<DeviceSelectionModeOption> DeviceModes { get; } =
+    public IReadOnlyList<DeviceSelectionModeOption> DeviceModes =>
     [
-        new(DeviceSelectionMode.FollowDefault, "Default Playback Device"),
-        new(DeviceSelectionMode.PinnedDevice, "Selected Device"),
+        new(DeviceSelectionMode.FollowDefault, _localization["Default Playback Device"]),
+        new(DeviceSelectionMode.PinnedDevice, _localization["Selected Device"]),
     ];
 
     public IReadOnlyList<int> DefaultBitDepthOptions { get; } = SupportedDefaultBitDepths;
@@ -269,25 +293,29 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public string FormatCacheStatusText
     {
-        get => _formatCacheStatusText;
+        get => _localization[_formatCacheStatusText];
         set => SetField(ref _formatCacheStatusText, value);
     }
 
     public string ResolverStatusText
     {
-        get => _resolverStatusText;
+        get => _localization[_resolverStatusText];
         set => SetField(ref _resolverStatusText, value);
     }
 
     public string CurrentTrackText
     {
-        get => _currentTrackText;
+        get => _lastStatus?.Track is { } track
+            ? $"{track.Title ?? _localization["Unknown Title"]} - {track.Artist ?? _localization["Unknown Artist"]}"
+            : _localization[_currentTrackText];
         set => SetField(ref _currentTrackText, value);
     }
 
     public string RequestedFormatText
     {
-        get => _requestedFormatText;
+        get => _lastStatus?.RequestedFormat is { } format
+            ? $"{AudioFormatTextFormatter.Format(format)} ({_localization[format.Source.ToString()]})"
+            : _requestedFormatText;
         set => SetField(ref _requestedFormatText, value);
     }
 
@@ -299,31 +327,31 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public string FailureReasonText
     {
-        get => _failureReasonText;
+        get => _localization.TranslateDiagnostic(_failureReasonText);
         set => SetField(ref _failureReasonText, value);
     }
 
     public string ActiveTargetDeviceNameText
     {
-        get => _activeTargetDeviceNameText;
+        get => _hasNamedActiveDevice ? _activeTargetDeviceNameText : _localization[_activeTargetDeviceNameText];
         set => SetField(ref _activeTargetDeviceNameText, value);
     }
 
     public string SupportedSampleRatesText
     {
-        get => _supportedSampleRatesText;
+        get => _localization[_supportedSampleRatesText];
         set => SetField(ref _supportedSampleRatesText, value);
     }
 
     public string SupportedBitDepthsText
     {
-        get => _supportedBitDepthsText;
+        get => _localization[_supportedBitDepthsText];
         set => SetField(ref _supportedBitDepthsText, value);
     }
 
     public string SupportedFormatsText
     {
-        get => _supportedFormatsText;
+        get => _localization[_supportedFormatsText];
         set => SetField(ref _supportedFormatsText, value);
     }
 
@@ -335,19 +363,19 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public string AppVersionText
     {
-        get => _appVersionText;
+        get => _localization[_appVersionText];
         set => SetField(ref _appVersionText, value);
     }
 
     public string UpdateStatusText
     {
-        get => _updateStatusText;
+        get => _localization.TranslateDiagnostic(_updateStatusText);
         set => SetField(ref _updateStatusText, value);
     }
 
     public string? UpdatePrimaryActionText
     {
-        get => _updatePrimaryActionText;
+        get => _updatePrimaryActionText is null ? null : _localization[_updatePrimaryActionText];
         set => SetField(ref _updatePrimaryActionText, value);
     }
 
@@ -441,7 +469,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public string OriginalFormatText
     {
-        get => _originalFormatText;
+        get => _localization[_originalFormatText];
         set => SetField(ref _originalFormatText, value);
     }
 
@@ -485,13 +513,15 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public string TrackTitleText
     {
-        get => _trackTitleText;
+        get => _lastStatus?.Track?.Title is { Length: > 0 } ? _trackTitleText : _localization[_trackTitleText];
         private set => SetField(ref _trackTitleText, value);
     }
 
     public string TrackMetaText
     {
-        get => _trackMetaText;
+        get => _lastStatus?.Track is { } track &&
+               (!string.IsNullOrWhiteSpace(track.Artist) || !string.IsNullOrWhiteSpace(track.Album))
+            ? _trackMetaText : _localization[_trackMetaText];
         private set => SetField(ref _trackMetaText, value);
     }
 
@@ -503,7 +533,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public string PhaseText
     {
-        get => _phaseText;
+        get => _localization[_phaseText];
         private set => SetField(ref _phaseText, value);
     }
 
@@ -530,21 +560,21 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     /// <summary>"Catalog match" / "Local file" / "Fallback", or empty to hide the chip.</summary>
     public string SourceChipText
     {
-        get => _sourceChipText;
+        get => _localization[_sourceChipText];
         private set => SetField(ref _sourceChipText, value);
     }
 
     /// <summary>Raw <see cref="AudioFormatSource"/> name for the details card.</summary>
     public string SourceRawText
     {
-        get => _sourceRawText;
+        get => _localization[_sourceRawText];
         private set => SetField(ref _sourceRawText, value);
     }
 
     /// <summary>"was 24-bit / 44.1 kHz" or "format carried over unchanged" under the hero readout.</summary>
     public string WasLine
     {
-        get => _wasLine;
+        get => _localization[_wasLine];
         private set => SetField(ref _wasLine, value);
     }
 
@@ -558,28 +588,28 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     /// <summary>Bare current device format ("24-bit / 192 kHz") for the tray flyout chip.</summary>
     public string CurrentDeviceFormatText
     {
-        get => _currentDeviceFormatText;
+        get => _localization[_currentDeviceFormatText];
         private set => SetField(ref _currentDeviceFormatText, value);
     }
 
     public string UpdateBadgeText
     {
-        get => _updateBadgeText;
+        get => _localization[_updateBadgeText];
         private set => SetField(ref _updateBadgeText, value);
     }
 
     public string DeviceModeChipText =>
-        SelectedMode == DeviceSelectionMode.PinnedDevice ? "Pinned" : "Follows default";
+        _localization[SelectedMode == DeviceSelectionMode.PinnedDevice ? "Pinned" : "Follows default"];
 
     public string AllowedFormatsNoteText =>
-        SampleRateOptions.All(option => option.IsChecked) && BitDepthOptions.All(option => option.IsChecked)
+        _localization[SampleRateOptions.All(option => option.IsChecked) && BitDepthOptions.All(option => option.IsChecked)
             ? "Everything checked — no restriction applied."
-            : "Resolved formats are clamped to the checked set, preferring the same 44.1 / 48 family. At least one of each stays enabled.";
+            : "Resolved formats are clamped to the checked set, preferring the same 44.1 / 48 family. At least one of each stays enabled."];
 
     public string StorefrontNoteText =>
         AppleMusicStorefront is { Length: > 0 } storefront
-            ? $"Override: “{storefront}”"
-            : $"Detected from the Windows region: {_detectedStorefront ?? "auto"}";
+            ? _localization.Format("Override: “{0}”", storefront)
+            : _localization.Format("Detected from the Windows region: {0}", _detectedStorefront ?? _localization["auto"]);
 
     public bool UseFixedBitDepthSelection => !SwitchBitDepth;
 
@@ -604,6 +634,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public void UpdateStatus(Services.SwitchingStatus status)
     {
+        _lastStatus = status;
         ResolverStatusText = status.ResolverStatusText;
         CurrentTrackText = status.Track is null
             ? "No track detected"
@@ -688,7 +719,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
         return text switch
         {
-            "Resolver: Waiting for Apple Music" or "Resolver: Starting" or "Resolver: Idle" => SwitchPhase.Idle,
+            "Resolver: Waiting for Apple Music" or "Resolver: Starting" or "Resolver: Idle" or "Resolver: Paused by user" => SwitchPhase.Idle,
             "Resolver: Detecting track" => SwitchPhase.Detecting,
             "Resolver: Resolving format" => SwitchPhase.Resolving,
             "Resolver: Error" or "Resolver: Failed" or "Resolver: No target device" => SwitchPhase.Failed,
@@ -705,6 +736,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             ? advice.Title
             : phase switch
     {
+        SwitchPhase.Idle when status.ResolverStatusText == "Resolver: Paused by user" => "Paused — press Play to continue",
         SwitchPhase.Idle => "Watching Apple Music media session",
         SwitchPhase.Detecting => "Track change — output muted",
         SwitchPhase.Resolving => "Matching in Apple Music catalog…",
@@ -777,7 +809,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public void AddActivity(string text, DateTimeOffset timestamp)
     {
-        ActivityLog.Insert(0, new ActivityLogEntry(timestamp.ToString("HH:mm"), text));
+        ActivityLog.Insert(0, new ActivityLogEntry(timestamp.ToString("HH:mm"), LocalizeActivity(text)) { SourceText = text });
         while (ActivityLog.Count > 8)
         {
             ActivityLog.RemoveAt(ActivityLog.Count - 1);
@@ -839,6 +871,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public void UpdateActiveTargetCapabilities(CurrentTargetDeviceCapabilitiesSnapshot snapshot)
     {
+        _hasNamedActiveDevice = snapshot.DeviceName is not null;
         ActiveTargetDeviceNameText = snapshot.DeviceName ?? "No active target device";
         SupportedSampleRatesText = AudioFormatTextFormatter.BuildSupportedSampleRatesText(snapshot.SupportedFormats);
         SupportedBitDepthsText = AudioFormatTextFormatter.BuildSupportedBitDepthsText(snapshot.SupportedFormats);
@@ -999,12 +1032,51 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null) =>
         PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
+
+    private void OnLanguageChanged(object? sender, EventArgs e)
+    {
+        // Refresh presentation only. Do not replay UpdateStatus, advance format bookkeeping,
+        // append activities, or raise changes for audio settings.
+        foreach (var property in GetType().GetProperties()
+                     .Where(property => property.PropertyType == typeof(string) &&
+                         (property.Name.EndsWith("Text", StringComparison.Ordinal) ||
+                          property.Name is nameof(RecoveryTitle) or nameof(RecoveryMessage) or
+                              nameof(WasLine) or nameof(UiLanguage))))
+            OnPropertyChanged(property.Name);
+        OnPropertyChanged(nameof(DeviceModes));
+        for (var index = 0; index < ActivityLog.Count; index++)
+        {
+            var item = ActivityLog[index];
+            ActivityLog[index] = item with { Text = LocalizeActivity(item.SourceText) };
+        }
+    }
+
+    private string LocalizeActivity(string text) => text.StartsWith("Failed: ", StringComparison.Ordinal)
+        ? _localization.Format("Failed: {0}", _localization.TranslateDiagnostic(text["Failed: ".Length..]))
+        : _localization[text];
+
+    private void OnPlaybackPropertyChanged(object? sender, PropertyChangedEventArgs e)
+    {
+        if (e.PropertyName != nameof(PlaybackControlsViewModel.IsBusy)) return;
+        RestartToolCommand.RaiseCanExecuteChanged();
+        RestartPlayerAndToolCommand.RaiseCanExecuteChanged();
+    }
+
+    public void DetachLocalization()
+    {
+        _localization.LanguageChanged -= OnLanguageChanged;
+        Playback.PropertyChanged -= OnPlaybackPropertyChanged;
+    }
 }
 
 public sealed record DeviceSelectionModeOption(DeviceSelectionMode Mode, string DisplayName);
+public sealed record UiLanguageOption(string Code, string DisplayName);
 
 /// <summary>One line in the Status page activity list.</summary>
-public sealed record ActivityLogEntry(string TimeText, string Text);
+public sealed record ActivityLogEntry(string TimeText, string Text)
+{
+    public string SourceText { get; init; } = Text;
+}
 
 /// <summary>
 /// A read-only chip on the Status page: lit when it is the currently applied value, dimmed with

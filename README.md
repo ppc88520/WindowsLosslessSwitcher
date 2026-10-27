@@ -26,7 +26,11 @@ The app lives in the system tray and stays out of the way. It is an independent 
 - Verifies audio is actually flowing after every switch, with automatic recovery if Apple Music's player stalls
 - Optional popup toast when a new format is applied
 - Tray-first UI with current format display, diagnostics export, and update checks
+- Play/pause, previous, next, and Open Apple Music controls in the main window and tray flyout
+- English by default, with live Traditional Chinese selection in settings
 - Installer with in-app updates, or a portable package if you prefer no installer
+
+The playback controls, language selector, and guarded/manual-recovery improvements described in this branch are proposed contributions for upstream review. Their presence here does not mean the upstream release linked below already includes them.
 
 ## Installation
 
@@ -74,6 +78,8 @@ An optional **Restart track after sample-rate changes (experimental)** setting p
 
 The main window and tray flyout also provide **Restart Tool** and **Restart Apple Music and Tool**, plus categorized recovery guidance. Manual restart confirms a pause and waits for the old process to exit before reopening the same executable. Restarting Apple Music is a separate confirmed action that may lose the queue. After an explicit restart, monitoring waits for user Play even with the experimental option off; the saved option is unchanged. See [manual recovery controls](MANUAL_RECOVERY_CONTROLS.md) for the sequence and limits.
 
+The same two surfaces provide **Previous**, **Play/Pause**, **Next**, and **Open Apple Music**. Availability follows the current Apple Music session and the switcher's safety state. Playback actions and manual restart share a busy gate; a command whose result is uncertain is not automatically resent. Previous uses Apple Music's own behavior, which may restart the current track or select the preceding one. See [playback controls and localization](PLAYBACK_CONTROLS_AND_LOCALIZATION.md) for usage and safety limits.
+
 Do also note that:
 
 - Normal live format switching can leave a few seconds of silence while the pipeline rebuilds, so audio may resume partway into the track. The optional restart sequence attempts to return the intended track to its beginning afterward. Same-rate tracks do not enter that new sequence, although existing format-lookup handling can still briefly mute output.
@@ -81,10 +87,18 @@ Do also note that:
 
 ## Settings
 
-Settings are stored at `%APPDATA%\WindowsLosslessSwitcher\settings.json`. The catalog cache `format-cache.json` and diagnostics logs are written to the same folder. (Versions before 1.0.0-beta.1 used `%LOCALAPPDATA%\WindowsLosslessSwitcher`; existing settings and logs are moved over automatically on first launch.) The common options are available from the app's window; the full file reference:
+Settings are stored at `%APPDATA%\WindowsLosslessSwitcher\settings.json`. The catalog cache `format-cache.json` and diagnostics logs are written to the same folder. (Versions before 1.0.0-beta.1 used `%LOCALAPPDATA%\WindowsLosslessSwitcher`; existing settings and logs are moved over automatically on first launch.) The common options are available from the app's window.
+
+Choose **Settings → Switching → Language** to switch between **English** and **繁體中文**. English is the default, including for existing settings without a language preference. The selection is saved and updates the open interface immediately. Changing display language does not restart either application, send playback commands, apply audio settings, change the Apple Music storefront, or change the process's numeric culture. Track metadata, device names, and original system error details retain their source text.
+
+Full settings reference:
 
 ```jsonc
 {
+  // Display language: "en" (default) or "zh-TW". Missing or unsupported values use English.
+  // This preference is independent of the Apple Music storefront and audio settings.
+  "uiLanguage": "en",
+
   // "followDefault" tracks whichever device Windows has set as the default playback device.
   // "pinnedDevice" targets the device identified by pinnedDeviceId instead.
   "deviceSelectionMode": "followDefault",

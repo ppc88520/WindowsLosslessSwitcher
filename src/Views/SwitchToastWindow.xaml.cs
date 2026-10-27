@@ -18,17 +18,19 @@ public partial class SwitchToastWindow : Window, ISwitchToastWindow
     private const double EdgeOffset = 16;
 
     private readonly DispatcherTimer _closeTimer;
+    private readonly SwitchToastContent _content;
 
     internal SwitchToastWindow(SwitchToastContent content)
     {
         InitializeComponent();
+        _content = content;
 
         if (content.Variant == ToastVariant.Pill)
         {
             RichRoot.Visibility = Visibility.Collapsed;
             PillRoot.Visibility = Visibility.Visible;
             PillRateText.Text = content.NewRateText ?? content.NewFormatText;
-            PillBitsText.Text = content.NewBitsText is { Length: > 0 } bits ? $"{bits} · lossless" : "lossless";
+            PillBitsText.Text = content.NewBitsText is { Length: > 0 } bits ? LocalizationService.Current.Format("{0} · lossless", bits) : LocalizationService.Current["lossless"];
             if (content.Artwork is not null)
             {
                 PillArtworkBrush.ImageSource = content.Artwork;
@@ -40,7 +42,7 @@ public partial class SwitchToastWindow : Window, ISwitchToastWindow
         }
         else
         {
-            KickerText.Text = Tracking.Apply(content.Kicker);
+            KickerText.Text = Tracking.Apply(LocalizationService.Current[content.Kicker]);
             if (content.OldFormatText is { Length: > 0 } old)
             {
                 OldFormatText.Text = old;
@@ -54,7 +56,8 @@ public partial class SwitchToastWindow : Window, ISwitchToastWindow
             NewFormatText.Text = content.NewFormatText ?? "";
             if (content.TrackLine is { Length: > 0 } trackLine)
             {
-                TrackLineText.Text = trackLine;
+                TrackLineText.Text = content.TrackUniqueKey is null || content.Kicker == "RATE UNDETERMINED"
+                    ? LocalizationService.Current[trackLine] : trackLine;
                 TrackLineText.Visibility = Visibility.Visible;
             }
 
@@ -82,7 +85,21 @@ public partial class SwitchToastWindow : Window, ISwitchToastWindow
             _closeTimer.Stop();
             Close();
         };
-        Closed += (_, _) => _closeTimer.Stop();
+        LocalizationService.Current.LanguageChanged += OnLanguageChanged;
+        Closed += (_, _) =>
+        {
+            _closeTimer.Stop();
+            LocalizationService.Current.LanguageChanged -= OnLanguageChanged;
+        };
+    }
+
+    private void OnLanguageChanged(object? sender, EventArgs e)
+    {
+        KickerText.Text = Tracking.Apply(LocalizationService.Current[_content.Kicker]);
+        PillBitsText.Text = _content.NewBitsText is { Length: > 0 } bits
+            ? LocalizationService.Current.Format("{0} · lossless", bits) : LocalizationService.Current["lossless"];
+        if (_content.Kicker == "RATE UNDETERMINED" && _content.TrackLine is { } explanation)
+            TrackLineText.Text = LocalizationService.Current[explanation];
     }
 
     public void StartAutoClose() => _closeTimer.Start();

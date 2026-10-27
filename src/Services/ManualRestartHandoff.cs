@@ -137,11 +137,11 @@ public static class ManualRestartHandoff
                 logger.Info($"Manual restart launched the same application executable; playerRestartConfirmed={playerSucceeded}.");
             });
             if (!completed && !File.Exists(requestPath + ".cancel"))
-                System.Windows.MessageBox.Show("The old application did not exit in time. It was not killed and no second copy was started. Pause Apple Music, then quit the tool manually.", ApplicationName);
+                LocalizedDialog.Show("The old application did not exit in time. It was not killed and no second copy was started. Pause Apple Music, then quit the tool manually.", ApplicationName);
         }
         catch (Exception ex)
         {
-            System.Windows.MessageBox.Show("Restart did not complete: " + ex.Message + "\nPause Apple Music, then launch Windows Lossless Switcher manually.", ApplicationName);
+            LocalizedDialog.Show(LocalizationService.Current.Format("Restart did not complete: {0}\nPause Apple Music, then launch Windows Lossless Switcher manually.", ex.Message), ApplicationName);
         }
     }
 }

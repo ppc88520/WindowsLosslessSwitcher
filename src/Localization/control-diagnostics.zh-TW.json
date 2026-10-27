@@ -1,0 +1,12 @@
+{
+  "A user playback command timed out and may still be queued; it was not retried.": "使用者的播放操作已逾時，但可能仍在佇列中，工具未重試。",
+  "A user playback command was canceled with an uncertain remote result; no retry is safe.": "使用者的播放操作已取消，但無法確定播放器的執行結果，因此不能安全重試。",
+  "Canceled processing did not stop before a user pause could be verified.": "無法在驗證使用者的暫停操作前，確認已取消的處理流程停止。",
+  "An earlier playback command may still execute. A reported pause cannot authorize unmuting or restarting.": "先前的播放指令可能仍會執行。即使播放器回報暫停，也不能據此解除靜音或重新啟動。",
+  "The player's pause request was rejected or unavailable.": "播放器拒絕了暫停指令，或目前無法暫停。",
+  "The player did not report a stable paused state after the user's request.": "使用者要求暫停後，播放器未回報穩定的暫停狀態。",
+  "A user pause timed out and may still be queued; it was not retried.": "使用者的暫停操作已逾時，但可能仍在佇列中，工具未重試。",
+  "User pause preparation was interrupted before a safe pause was confirmed.": "在確認安全暫停前，使用者暫停操作的準備流程已中斷。",
+  "Restart was stopped because an earlier playback command may still execute. A reported pause cannot authorize releasing protective mute.": "先前的播放指令可能仍會執行，因此已停止重啟。即使播放器回報暫停，也不能據此解除保護靜音。",
+  "Apple Music {0} command timed out; it may still be queued. Automatic replay or navigation retry is unsafe.": "Apple Music 的 {0} 指令已逾時，但可能仍在佇列中。無法安全地自動重播或重試切歌。"
+}

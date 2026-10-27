@@ -1335,6 +1335,14 @@ public sealed partial class SwitchingCoordinatorTests
 
         public bool CanPlay { get; set; } = true;
 
+        public bool CanNext { get; set; }
+
+        public bool CanPrevious { get; set; }
+
+        public Func<CancellationToken, Task<bool>>? NextHandler { get; set; }
+
+        public Func<CancellationToken, Task<bool>>? PlayHandler { get; set; }
+
         public bool PauseResult { get; set; } = true;
 
         public bool PlayResult { get; set; } = true;
@@ -1383,7 +1391,11 @@ public sealed partial class SwitchingCoordinatorTests
                 CanPause,
                 CanPlay,
                 TimelinePosition,
-                DateTimeOffset.UtcNow);
+                DateTimeOffset.UtcNow)
+            {
+                CanNext = CanNext,
+                CanPrevious = CanPrevious,
+            };
         }
 
         public Task<bool> TryPauseAsync(CancellationToken cancellationToken)
@@ -1405,6 +1417,7 @@ public sealed partial class SwitchingCoordinatorTests
             PlayCallCount++;
             RecordCommand("play");
             PlayInvoked?.Invoke();
+            if (PlayHandler is not null) return PlayHandler(cancellationToken);
             if (PlayFailuresBeforeSuccess > 0)
             {
                 PlayFailuresBeforeSuccess--;
@@ -1485,7 +1498,7 @@ public sealed partial class SwitchingCoordinatorTests
         public Task<bool> TrySkipNextAsync(CancellationToken cancellationToken)
         {
             SkipNextCallCount++;
-            return Task.FromResult(true);
+            return NextHandler?.Invoke(cancellationToken) ?? Task.FromResult(true);
         }
     }
 

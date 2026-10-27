@@ -17,6 +17,10 @@ public sealed record MediaTransportState(
     TimeSpan? TimelinePosition,
     DateTimeOffset ObservedAtUtc)
 {
+    // Optional capabilities keep existing callers and fake transports source-compatible.
+    public bool CanNext { get; init; }
+    public bool CanPrevious { get; init; }
+
     public bool IsPlaying => PlaybackStatus == MediaTransportPlaybackStatus.Playing;
 
     public static MediaTransportState CreateUnavailable() =>

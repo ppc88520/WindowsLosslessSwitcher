@@ -18,6 +18,7 @@ public static class Program
     {
         if (args.Length == 2 && args[0] == ManualRestartHandoff.HelperArgument)
         {
+            LoadUiLanguage();
             ManualRestartHandoff.RunHelperAsync(args[1]).GetAwaiter().GetResult();
             return;
         }
@@ -26,9 +27,13 @@ public static class Program
         // Must run before App is constructed: its field initializers create the logger, which
         // creates the new data folder and would shadow files still at the legacy location.
         AppDataPaths.MigrateFromLegacyLocation();
+        LoadUiLanguage();
 
         var app = new App();
         app.InitializeComponent();
         app.Run();
     }
+
+    private static void LoadUiLanguage() => LocalizationService.Current.SetLanguage(
+        LocalizationService.ReadSavedLanguage(System.IO.Path.Combine(AppDataPaths.RootDirectory, "settings.json")));
 }
