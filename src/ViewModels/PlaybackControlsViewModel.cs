@@ -15,9 +15,15 @@ public sealed class PlaybackControlsViewModel : INotifyPropertyChanged, IDisposa
     private bool _restartBusy;
     private bool _disposed;
     private string? _lastResult;
+    private readonly BackgroundUiRefresh<UserPlaybackAvailability> _refresh;
+    private Task _activeCommandWorker = Task.CompletedTask;
 
     public PlaybackControlsViewModel()
     {
+        _refresh = new BackgroundUiRefresh<UserPlaybackAvailability>(
+            _ => _coordinator?.GetUserPlaybackAvailability() ?? Unavailable(),
+            availability => { if (!_disposed) { _availability = availability; RaiseStateChanged(); } },
+            onError: _ => { if (!_disposed) { _availability = Unavailable(); RaiseStateChanged(); } });
         TogglePlaybackCommand = new RelayCommand(() => _ = ExecuteAsync(_availability.PlaybackStatus == MediaTransportPlaybackStatus.Playing
             ? UserPlaybackAction.Pause : UserPlaybackAction.Play), () => !_disposed && !_restartBusy && !IsBusy && (_availability.CanPause || _availability.CanPlay));
         PreviousTrackCommand = new RelayCommand(() => _ = ExecuteAsync(UserPlaybackAction.Previous), () => !_disposed && !_restartBusy && !IsBusy && _availability.CanPrevious);
@@ -38,8 +44,11 @@ public sealed class PlaybackControlsViewModel : INotifyPropertyChanged, IDisposa
         : _lastResult ?? (_availability.PlaybackStatus == MediaTransportPlaybackStatus.Unknown ? "Apple Music is not connected."
             : _availability.IsBusy ? "Playback controls are temporarily unavailable." : "")];
 
-    public void Configure(SwitchingCoordinator coordinator, IAppleMusicProcessController processController)
+    public void Configure(SwitchingCoordinator coordinator, IAppleMusicProcessController processController,
+        SynchronizationContext? context = null)
     {
+        if (_disposed) return;
+        if ((context ?? SynchronizationContext.Current) is { } uiContext) _refresh.BindContext(uiContext);
         _coordinator = coordinator;
         _processController = processController;
         Refresh();
@@ -47,20 +56,25 @@ public sealed class PlaybackControlsViewModel : INotifyPropertyChanged, IDisposa
 
     public void SetRestartBusy(bool busy)
     {
+        if (_disposed) return;
         _restartBusy = busy;
+        RaiseStateChanged();
         Refresh();
     }
 
     public void Refresh()
     {
         if (_disposed) return;
-        try
-        {
-            if (_coordinator is not null) _availability = _coordinator.GetUserPlaybackAvailability();
-        }
-        catch (ObjectDisposedException) { _availability = new(MediaTransportPlaybackStatus.Unknown, false, false, false, false, false, false); }
-        RaiseStateChanged();
+        if (_coordinator is null) { RaiseStateChanged(); return; }
+        _ = RefreshAsync();
     }
+
+    public Task RefreshAsync() => _disposed || _coordinator is null ? Task.CompletedTask : _refresh.RequestAsync();
+
+    public Task DrainAsync() => Task.WhenAll(_refresh.DrainAsync(), Volatile.Read(ref _activeCommandWorker));
+
+    private static UserPlaybackAvailability Unavailable() =>
+        new(MediaTransportPlaybackStatus.Unknown, false, false, false, false, false, false);
 
     private async Task ExecuteAsync(UserPlaybackAction action)
     {
@@ -68,10 +82,18 @@ public sealed class PlaybackControlsViewModel : INotifyPropertyChanged, IDisposa
         IsBusy = true;
         _lastResult = null;
         RaiseStateChanged();
-        try { _lastResult = (await _coordinator.ExecuteUserPlaybackAsync(action, _lifetime.Token)).Message; }
+        var coordinator = _coordinator;
+        var token = _lifetime.Token;
+        try
+        {
+            var worker = Task.Run(() => coordinator.ExecuteUserPlaybackAsync(action, token), token);
+            Volatile.Write(ref _activeCommandWorker, worker);
+            var result = await worker;
+            if (!_disposed) _lastResult = result.Message;
+        }
         catch (OperationCanceledException) { }
-        catch { _lastResult = "Playback control failed. Check the recovery guidance."; }
-        finally { IsBusy = false; Refresh(); }
+        catch { if (!_disposed) _lastResult = "Playback control failed. Check the recovery guidance."; }
+        finally { if (!_disposed) { IsBusy = false; RaiseStateChanged(); Refresh(); } }
     }
 
     private async Task OpenAsync()
@@ -82,18 +104,23 @@ public sealed class PlaybackControlsViewModel : INotifyPropertyChanged, IDisposa
         RaiseStateChanged();
         try
         {
-            _lastResult = await _processController.TryOpenAsync(_lifetime.Token)
-                ? "Apple Music opened." : "Could not open Apple Music.";
+            var processController = _processController;
+            var token = _lifetime.Token;
+            var worker = Task.Run(() => processController.TryOpenAsync(token), token);
+            Volatile.Write(ref _activeCommandWorker, worker);
+            var opened = await worker;
+            if (!_disposed) _lastResult = opened ? "Apple Music opened." : "Could not open Apple Music.";
         }
         catch (OperationCanceledException) { }
-        catch { _lastResult = "Could not open Apple Music."; }
-        finally { IsBusy = false; Refresh(); }
+        catch { if (!_disposed) _lastResult = "Could not open Apple Music."; }
+        finally { if (!_disposed) { IsBusy = false; RaiseStateChanged(); Refresh(); } }
     }
 
     private void OnLanguageChanged(object? sender, EventArgs e) => RaiseStateChanged();
 
     private void RaiseStateChanged()
     {
+        if (_disposed) return;
         PropertyChanged?.Invoke(this, new(nameof(IsBusy)));
         PropertyChanged?.Invoke(this, new(nameof(PlayPauseText)));
         PropertyChanged?.Invoke(this, new(nameof(StatusText)));
@@ -107,6 +134,7 @@ public sealed class PlaybackControlsViewModel : INotifyPropertyChanged, IDisposa
     {
         if (_disposed) return;
         _disposed = true;
+        _refresh.Dispose();
         _lifetime.Cancel();
         LocalizationService.Current.LanguageChanged -= OnLanguageChanged;
         _coordinator = null;

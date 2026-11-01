@@ -46,18 +46,19 @@ public sealed partial class SwitchingCoordinator
 
     public UserPlaybackAvailability GetUserPlaybackAvailability()
     {
+        var outputReady = IsAudioOutputReady();
         var state = ReadPlaybackState();
         var stopped = _stopping || _manualRestartRequested;
-        var busy = stopped || _userPauseRequested || Volatile.Read(ref _userPlaybackCommandActive) != 0 ||
+        var busy = stopped || IsDacLockChangeInProgress || _userPauseRequested || Volatile.Read(ref _userPlaybackCommandActive) != 0 ||
             _switchLock.CurrentCount == 0;
         var known = state.PlaybackStatus is MediaTransportPlaybackStatus.Playing or
             MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped;
         return new(state.PlaybackStatus,
-            !busy && !HasUnconfirmedPlaybackCommand && !_previousRestartSafetyHold && _manualTrackHold is null &&
+            outputReady && !busy && !HasUnconfirmedPlaybackCommand && !_previousRestartSafetyHold && _manualTrackHold is null &&
                 (state.PlaybackStatus is MediaTransportPlaybackStatus.Paused or MediaTransportPlaybackStatus.Stopped) && state.CanPlay,
-            !stopped && !_playbackCommands.IsUncertain && !_userPauseRequested && Volatile.Read(ref _userPlaybackCommandActive) == 0 && state.IsPlaying && state.CanPause,
-            !busy && !HasUnconfirmedPlaybackCommand && !_previousRestartSafetyHold && known && state.CanPrevious,
-            !busy && !HasUnconfirmedPlaybackCommand && !_previousRestartSafetyHold && known && state.CanNext,
+            !stopped && !IsDacLockChangeInProgress && !_playbackCommands.IsUncertain && !_userPauseRequested && Volatile.Read(ref _userPlaybackCommandActive) == 0 && state.IsPlaying && state.CanPause,
+            outputReady && !busy && !HasUnconfirmedPlaybackCommand && !_previousRestartSafetyHold && known && state.CanPrevious,
+            outputReady && !busy && !HasUnconfirmedPlaybackCommand && !_previousRestartSafetyHold && known && state.CanNext,
             busy,
             _playbackCommands.IsUncertain || _previousRestartSafetyHold || _manualTrackHold is not null);
     }
@@ -73,10 +74,14 @@ public sealed partial class SwitchingCoordinator
             return new(false, "Playback controls are temporarily unavailable.");
         try
         {
+            if (IsDacLockChangeInProgress)
+                return new(false, "Playback controls are unavailable while changing the DAC lock.");
             if (_stopping || _manualRestartRequested)
                 return new(false, "Playback controls are unavailable during restart.");
             if (action == UserPlaybackAction.Pause)
                 return await PauseForUserAsync(token);
+            if (!IsAudioOutputReady())
+                return new(false, "Playback controls are unavailable until the default output is a supported DAC.");
             if (_previousRestartSafetyHold || (action == UserPlaybackAction.Play && _manualTrackHold is not null))
                 return new(false, "Playback is held for safety. Follow the recovery guidance.");
             if (_userPauseRequested || !await _switchLock.WaitAsync(0, token))

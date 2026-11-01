@@ -89,6 +89,101 @@ public sealed class AppleMusicAudioMonitorTests : IDisposable
         return condition();
     }
 
+    private sealed class BlockingCaptureFactory : ISpectrographCaptureFactory
+    {
+        public ManualResetEventSlim Entered { get; } = new();
+        public ManualResetEventSlim Release { get; } = new();
+        public FakeSession Session { get; } = new() { TargetPid = 4242 };
+        public ISpectrographCaptureSession Create(int pid, Action<float[], int> samples, Action<Exception> failed)
+        {
+            Entered.Set();
+            if (!Release.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Test did not release the fake driver.");
+            return Session;
+        }
+    }
+
+    [Fact]
+    public async Task BackgroundCapture_ARealDispatcherCanClickAndReleaseVisibilityWhileDriverIsBlocked()
+    {
+        var factory = new BlockingCaptureFactory();
+        var ready = new TaskCompletionSource<(System.Windows.Threading.Dispatcher Dispatcher, System.Windows.Controls.Button Button)>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var clicked = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var finished = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(() =>
+        {
+            try
+            {
+                using var monitor = new AppleMusicAudioMonitor(_logger, new FakeTransport(), factory, () => 4242,
+                    audioOutputReady: () => true, backgroundWork: true);
+                using var lease = monitor.AcquireVisibleLease();
+                var button = new System.Windows.Controls.Button();
+                button.Click += (_, _) =>
+                {
+                    // These public calls previously waited behind the native capture lock.
+                    lease.Dispose();
+                    monitor.RefreshOutputSafety();
+                    clicked.TrySetResult(true);
+                };
+                ready.TrySetResult((System.Windows.Threading.Dispatcher.CurrentDispatcher, button));
+                System.Windows.Threading.Dispatcher.Run();
+                finished.TrySetResult(true);
+            }
+            catch (Exception ex) { ready.TrySetException(ex); finished.TrySetException(ex); }
+        }) { IsBackground = true };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        var ui = await ready.Task.WaitAsync(TimeSpan.FromSeconds(3));
+        try
+        {
+            Assert.True(factory.Entered.Wait(TimeSpan.FromSeconds(3)));
+            _ = ui.Dispatcher.BeginInvoke(() => ui.Button.RaiseEvent(new System.Windows.RoutedEventArgs(System.Windows.Controls.Button.ClickEvent)));
+            Assert.True(await clicked.Task.WaitAsync(TimeSpan.FromSeconds(2)));
+            Assert.False(factory.Release.IsSet);
+            Assert.False(factory.Session.Started);
+        }
+        finally
+        {
+            factory.Release.Set();
+            ui.Dispatcher.BeginInvokeShutdown(System.Windows.Threading.DispatcherPriority.Send);
+            await finished.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.True(thread.Join(TimeSpan.FromSeconds(2)));
+        }
+        Assert.True(factory.Session.Disposed);
+        Assert.False(factory.Session.Started);
+    }
+
+    [Fact]
+    public void DacGuard_BlockedOutputNeverOpensCaptureAndReconnectRequiresFreshCheck()
+    {
+        var factory = new FakeFactory();
+        var ready = false;
+        using var monitor = new AppleMusicAudioMonitor(_logger, new FakeTransport(), factory, () => 4242,
+            audioOutputReady: () => ready);
+        using var lease = monitor.AcquireVisibleLease();
+        monitor.RefreshOutputSafety();
+        Assert.Empty(factory.Sessions);
+        ready = true;
+        monitor.RefreshOutputSafety();
+        Assert.True(Assert.Single(factory.Sessions).Started);
+        ready = false;
+        monitor.RefreshOutputSafety();
+        Assert.True(factory.Sessions[0].Disposed);
+        monitor.RefreshOutputSafety();
+        Assert.Single(factory.Sessions);
+        Assert.False(monitor.IsActive);
+    }
+
+    [Fact]
+    public void DacGuard_UnreadableOutputDoesNotOpenCapture()
+    {
+        var factory = new FakeFactory();
+        using var monitor = new AppleMusicAudioMonitor(_logger, new FakeTransport(), factory, () => 4242,
+            audioOutputReady: () => throw new InvalidOperationException("Device unavailable"));
+        using var lease = monitor.AcquireVisibleLease();
+        monitor.RefreshOutputSafety();
+        Assert.Empty(factory.Sessions);
+    }
+
     [Fact]
     public void FirstLease_StartsCaptureWithResolvedPid()
     {

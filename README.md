@@ -1,5 +1,7 @@
 # Windows Lossless Switcher
 
+This branch, `test/dac-ui-lock-v03`, contains **DAC Guard TEST 0.3** (`1.0.0-beta.7-dac0.3`), an isolated acceptance-build derivative of [jordanmgibson's original project](https://github.com/jordanmgibson/WindowsLosslessSwitcher). It is not an upstream release. It uses `WindowsLosslessSwitcher.DacGuardTest` for both the executable and its separate data folder, and currently supports only the verified TOPPING DX1 II USB identity. Read [DAC Guard test build](DAC_GUARD_TEST.md) for its routing policy, pause controls, build commands, test evidence, and limitations before running it. The screenshots below show the upstream interface rather than this snapshot.
+
 [![CI](https://github.com/jordanmgibson/WindowsLosslessSwitcher/actions/workflows/ci.yml/badge.svg)](https://github.com/jordanmgibson/WindowsLosslessSwitcher/actions/workflows/ci.yml)
 
 Windows Lossless Switcher switches your audio device's sample rate to match the currently playing lossless song in Apple Music for Windows, automatically.
@@ -21,18 +23,22 @@ The app lives in the system tray and stays out of the way. It is an independent 
 
 - Automatic sample-rate and optional bit-depth switching for Apple Music for Windows
 - Exact format matching against the Apple Music catalog; local files are matched to their actual file format
-- Follows the Windows default playback device, or pins a specific device
+- Requires the supported DAC and confirms its Windows default playback roles before protected operations; device pinning is disabled in this test build
+- Pause or resume DAC lock from the main window, tray, or settings; the paused state survives a restart
 - Mutes the target device during format switching and unmutes once the rebuilt pipeline produces real audio
 - Verifies audio is actually flowing after every switch, with automatic recovery if Apple Music's player stalls
 - Optional popup toast when a new format is applied
-- Tray-first UI with current format display, diagnostics export, and update checks
+- Tray-first UI with current format display and diagnostics export
 - Play/pause, previous, next, and Open Apple Music controls in the main window and tray flyout
 - English by default, with live Traditional Chinese selection in settings
-- Installer with in-app updates, or a portable package if you prefer no installer
+- Refined Nocturne layout, Inter for Latin text, and bundled Noto Sans CJK TC for Traditional Chinese
+- Separate portable-test identity with updates, startup registration, and legacy data migration disabled
 
-The playback controls, language selector, and guarded/manual-recovery improvements described in this branch are proposed contributions for upstream review. Their presence here does not mean the upstream release linked below already includes them.
+The playback controls, language selector, and guarded/manual-recovery improvements derive from proposed upstream contributions. This DAC-test snapshot is a separate branch; its presence here does not mean the existing upstream PR or release includes its DAC/UI changes.
 
-## Installation
+## Upstream installation
+
+These instructions describe the original project's published releases, not DAC Guard TEST 0.3. For this branch, see [building and running the isolated test](DAC_GUARD_TEST.md#build-and-run).
 
 1. Go to the [latest release](https://github.com/jordanmgibson/WindowsLosslessSwitcher/releases/latest).
 2. Download `WindowsLosslessSwitcher-win-x64-Setup.exe` (or the `win-arm64` variant for ARM devices).
@@ -51,7 +57,7 @@ Worth knowing:
 
 - Windows 11 or Windows 10 (version 2004 / build 19041 or later), x64 or ARM64 — Windows 10 needs v1.0.0-beta.3 or newer, because Windows 10 reports Apple Music's media session under a different identity
 - Apple Music for Windows (Microsoft Store version 1.1540.23042.0 or higher), with High-Res Lossless enabled in its audio quality settings
-- An audio device where the shared-mode format matters to you — typically an external DAC, AVR, or USB audio interface
+- For this test branch: TOPPING DX1 II with verified physical USB identity `VID_152A&PID_8750`; a friendly device name or USB connection alone is insufficient
 
 ### Getting the cleanest output
 
@@ -74,7 +80,7 @@ Successful catalog matches are kept in a versioned local cache, scoped to the Ap
 
 With the experimental restart option off, the normal switching path mutes the device after detecting the track change and applies the new shared-mode format live, under Apple Music's running audio stream. Windows invalidates the stream and Apple Music rebuilds it; once real audio is confirmed, the app unmutes. If playback stalls, the normal recovery ladder can escalate from a nudge to a skip and, when enabled, an automatic Apple Music restart.
 
-An optional **Restart track after sample-rate changes (experimental)** setting pauses before a rate change and keeps the output device muted until the same track is confirmed back at its beginning. It is disabled by default, waits for the user's Play if already paused, and can take ten seconds or longer. While enabled, failed audio recovery stops for manual handling instead of automatically skipping tracks or restarting Apple Music. The first manually played track may still be audible briefly before mute control is obtained; about two seconds was reported in the independent test build. See [guarded track restart](GUARDED_TRACK_RESTART.md) for the behavior, limitations, and manual test procedure.
+An optional **Restart track after sample-rate changes (experimental)** setting pauses before a rate change and keeps the output device muted until the same track is confirmed back at its beginning. It is off by default in the base contribution, but enabled on first run of this isolated test profile. It waits for the user's Play if already paused and can take ten seconds or longer. While enabled, failed audio recovery stops for manual handling instead of automatically skipping tracks or restarting Apple Music. Automatic player restart is disabled throughout this test build. The first manually played track may still be audible briefly before mute control is obtained; about two seconds was reported in an earlier independent test build. See [guarded track restart](GUARDED_TRACK_RESTART.md) for the behavior, limitations, and manual test procedure.
 
 The main window and tray flyout also provide **Restart Tool** and **Restart Apple Music and Tool**, plus categorized recovery guidance. Manual restart confirms a pause and waits for the old process to exit before reopening the same executable. Restarting Apple Music is a separate confirmed action that may lose the queue. After an explicit restart, monitoring waits for user Play even with the experimental option off; the saved option is unchanged. See [manual recovery controls](MANUAL_RECOVERY_CONTROLS.md) for the sequence and limits.
 
@@ -87,7 +93,7 @@ Do also note that:
 
 ## Settings
 
-Settings are stored at `%APPDATA%\WindowsLosslessSwitcher\settings.json`. The catalog cache `format-cache.json` and diagnostics logs are written to the same folder. (Versions before 1.0.0-beta.1 used `%LOCALAPPDATA%\WindowsLosslessSwitcher`; existing settings and logs are moved over automatically on first launch.) The common options are available from the app's window.
+This test build stores settings at `%APPDATA%\WindowsLosslessSwitcher.DacGuardTest\settings.json`. The catalog cache `format-cache.json` and diagnostics logs use that separate folder. It reuses the DAC-test profile from dac0.1/dac0.2 and does not read or migrate installed-app data. The common options are available from the app's window. The example below reflects a fresh test profile; existing DAC-test preferences are preserved except for the enforced test restrictions described in [DAC Guard test build](DAC_GUARD_TEST.md#isolation-and-defaults).
 
 Choose **Settings → Switching → Language** to switch between **English** and **繁體中文**. English is the default, including for existing settings without a language preference. The selection is saved and updates the open interface immediately. Changing display language does not restart either application, send playback commands, apply audio settings, change the Apple Music storefront, or change the process's numeric culture. Track metadata, device names, and original system error details retain their source text.
 
@@ -99,24 +105,25 @@ Full settings reference:
   // This preference is independent of the Apple Music storefront and audio settings.
   "uiLanguage": "en",
 
-  // "followDefault" tracks whichever device Windows has set as the default playback device.
-  // "pinnedDevice" targets the device identified by pinnedDeviceId instead.
+  // Enforced to followDefault in this test build, subject to the DAC-only routing guard.
   "deviceSelectionMode": "followDefault",
 
-  // Required when deviceSelectionMode is "pinnedDevice". Ignored otherwise.
-  // Value is the Windows device ID string (e.g. "{0.0.0.00000000}.{guid}").
+  // Cleared in this test build; device pinning is disabled.
   "pinnedDeviceId": null,
 
-  // Register the app to start automatically when Windows starts.
+  // Enforced false; startup registration is disabled in this test build.
   "launchAtLogin": false,
 
   // When true, the app also switches the bit depth of the target device (e.g. 16-bit → 24-bit).
   // When false, use defaultBitDepth rather than following each track's bit depth.
-  "switchBitDepth": true,
+  "switchBitDepth": false,
 
   // Experimental: pause before a sample-rate change, then restart the same track.
   // Includes muted preparation of at least ten seconds; no new restart sequence for unchanged rates.
-  "restartTrackAfterSampleRateChange": false,
+  "restartTrackAfterSampleRateChange": true,
+
+  // Pause DAC routing and protected switching work. Saved until explicitly resumed.
+  "dacLockPaused": false,
 
   // Default bit depth applied when the resolved format does not specify one.
   // Accepted values: 16 or 24.
@@ -158,11 +165,8 @@ Full settings reference:
   // window; applies after the app restarts.
   "appleMusicStorefront": null,
 
-  // Last-resort recovery: when playback wedges repeatedly and every lighter recovery fails,
-  // restart Apple Music automatically (its play queue may reset — Apple Music cannot restore
-  // it across restarts). Disable to keep recovery limited to nudges and track skips.
-  // Applies when the experimental restart option is off. Also editable from the app window.
-  "restartAppleMusicOnPlaybackFailure": true,
+  // Enforced false in this test build; automatic player restart is disabled.
+  "restartAppleMusicOnPlaybackFailure": false,
 
   // Set by the app when it captures a pre-switch device format for later restoration.
   // Edit or remove this field to reset the saved restore point.
@@ -172,7 +176,7 @@ Full settings reference:
 
 ## Troubleshooting
 
-- If no target device is available, refresh devices from the UI and confirm the selected render endpoint still exists.
+- If no target device is available, confirm that the supported DAC is connected and active. The test build blocks unverified outputs; use Pause DAC Lock before manually selecting another speaker in Windows.
 - If exact matching stops working after an Apple Music update, export diagnostics from the app window and open an issue — catalog matching or fallback ordering may need adjustment.
 - If the app is already running, a second launch will exit and the existing instance will remain active in the tray.
 
@@ -184,7 +188,7 @@ Apple Music can stream lossless audio up to 24-bit / 192 kHz, but on Windows it 
 
 ## Devices tested
 
-Combinations reported to work by users. Regardless, you use the app at your own risk.
+The following are reports for the original project, not an eligibility list or hardware acceptance for this DAC-test branch. This branch currently allows only the TOPPING identity documented above. Regardless, you use the app at your own risk.
 
 | Windows version | Apple Music version | Audio device |
 | --------------- | ------------------- | ------------ |

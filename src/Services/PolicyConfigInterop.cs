@@ -5,6 +5,15 @@ namespace WindowsLosslessSwitcher.Services;
 
 public static class PolicyConfigInterop
 {
+    /// <summary>Selects a playback default; the communications role is deliberately excluded.</summary>
+    public static void SetDefaultPlaybackEndpoint(string deviceId, int role)
+    {
+        if (role is not (0 or 1)) throw new ArgumentOutOfRangeException(nameof(role));
+        var policyConfig = CreatePolicyConfig();
+        try { Marshal.ThrowExceptionForHR(policyConfig.SetDefaultEndpoint(deviceId, role)); }
+        finally { Marshal.FinalReleaseComObject(policyConfig); }
+    }
+
     public static WaveFormat? GetDeviceFormat(string deviceId)
     {
         var policyConfig = CreatePolicyConfig();

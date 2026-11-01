@@ -271,6 +271,110 @@ public sealed partial class SwitchingCoordinatorTests
     }
 
     [Fact]
+    public async Task PlaybackViewModelCreatedBeforeAUiContextUsesTheConfiguredDispatcher()
+    {
+        var previousContext = SynchronizationContext.Current;
+        PlaybackControlsViewModel vm;
+        try
+        {
+            SynchronizationContext.SetSynchronizationContext(null);
+            vm = new PlaybackControlsViewModel();
+        }
+        finally { SynchronizationContext.SetSynchronizationContext(previousContext); }
+        using (vm)
+        using (var release = new ManualResetEventSlim())
+        {
+            var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var transport = new TestMediaTransportController
+            {
+                PlaybackStateRead = () =>
+                {
+                    entered.TrySetResult();
+                    if (!release.Wait(TimeSpan.FromSeconds(8))) throw new TimeoutException();
+                },
+            };
+            await using var coordinator = CreateCoordinator(new TestTrackSource(), transport, PauseEndpoint(), PauseResolver(CurrentFormat));
+            await BackgroundUiRefreshTests.OnDispatcher(async dispatcher =>
+            {
+                var appliedOnDispatcher = false;
+                vm.PropertyChanged += (_, _) => appliedOnDispatcher = dispatcher.CheckAccess();
+                vm.Configure(coordinator, new OpenOnlyProcessController(),
+                    new System.Windows.Threading.DispatcherSynchronizationContext(dispatcher));
+                try
+                {
+                    await entered.Task.WaitAsync(DefaultTimeout);
+                    var click = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    _ = dispatcher.BeginInvoke(() => click.TrySetResult());
+                    await click.Task.WaitAsync(DefaultTimeout);
+                    Assert.False(vm.TogglePlaybackCommand.CanExecute(null));
+                }
+                finally { release.Set(); }
+                await vm.RefreshAsync().WaitAsync(DefaultTimeout);
+                Assert.True(appliedOnDispatcher);
+                Assert.True(vm.TogglePlaybackCommand.CanExecute(null));
+            });
+        }
+    }
+
+    [Fact]
+    public async Task PlaybackViewModelDisposalDrainsBlockedOpenWithoutLateUiUpdates() =>
+        await VerifyPlaybackDisposalDrainAsync(openPlayer: true);
+
+    [Fact]
+    public async Task PlaybackViewModelDisposalDrainsBlockedNavigationWithoutLateUiUpdates() =>
+        await VerifyPlaybackDisposalDrainAsync(openPlayer: false);
+
+    private async Task VerifyPlaybackDisposalDrainAsync(bool openPlayer)
+    {
+        using var release = new ManualResetEventSlim();
+        var entered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var returned = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<bool> BlockedCommand(CancellationToken token)
+        {
+            entered.TrySetResult();
+            if (!release.Wait(TimeSpan.FromSeconds(8))) throw new TimeoutException();
+            returned.TrySetResult();
+            return Task.FromResult(true);
+        }
+        var transport = new TestMediaTransportController { CanNext = true, NextHandler = BlockedCommand };
+        await using var coordinator = CreateCoordinator(new TestTrackSource(), transport, PauseEndpoint(), PauseResolver(CurrentFormat));
+        await BackgroundUiRefreshTests.OnDispatcher(async dispatcher =>
+        {
+            using var vm = new PlaybackControlsViewModel();
+            vm.Configure(coordinator, new DelegateOpenProcessController(BlockedCommand),
+                new System.Windows.Threading.DispatcherSynchronizationContext(dispatcher));
+            await vm.RefreshAsync().WaitAsync(DefaultTimeout);
+            var notifications = 0;
+            vm.PropertyChanged += (_, _) => notifications++;
+            if (openPlayer) vm.OpenAppleMusicCommand.Execute(null);
+            else vm.NextTrackCommand.Execute(null);
+            try
+            {
+                await entered.Task.WaitAsync(DefaultTimeout);
+                vm.Dispose();
+                var countAtDispose = notifications;
+                var drain = vm.DrainAsync();
+                Assert.False(drain.IsCompleted);
+                Assert.False(vm.OpenAppleMusicCommand.CanExecute(null));
+                Assert.False(vm.NextTrackCommand.CanExecute(null));
+                release.Set();
+                try { await drain.WaitAsync(DefaultTimeout); }
+                catch (OperationCanceledException) { }
+                await returned.Task.WaitAsync(DefaultTimeout);
+                await System.Windows.Threading.Dispatcher.Yield(System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+                Assert.Equal(countAtDispose, notifications);
+            }
+            finally { release.Set(); }
+        });
+    }
+
+    private sealed class DelegateOpenProcessController(Func<CancellationToken, Task<bool>> open) : IAppleMusicProcessController
+    {
+        public Task<bool> TryOpenAsync(CancellationToken token) => open(token);
+        public Task<bool> TryRestartAsync(CancellationToken token) => Task.FromResult(false);
+    }
+
+    [Fact]
     public async Task PlaybackViewModelOpenUsesOnlyOpenAndRestartBusyDisablesAllCommands()
     {
         var process = new OpenOnlyProcessController();
@@ -280,8 +384,10 @@ public sealed partial class SwitchingCoordinatorTests
         Assert.False(vm.OpenAppleMusicCommand.CanExecute(null));
         Assert.False(vm.TogglePlaybackCommand.CanExecute(null));
         vm.Configure(coordinator, process);
+        await vm.RefreshAsync().WaitAsync(DefaultTimeout);
         Assert.True(vm.TogglePlaybackCommand.CanExecute(null));
         vm.OpenAppleMusicCommand.Execute(null);
+        await process.Opened.Task.WaitAsync(DefaultTimeout);
         Assert.Equal(1, process.OpenCalls);
         Assert.Equal(0, process.RestartCalls);
         Assert.Equal(0, transport.PlayCallCount);
@@ -295,8 +401,9 @@ public sealed partial class SwitchingCoordinatorTests
     private sealed class OpenOnlyProcessController : IAppleMusicProcessController
     {
         public int OpenCalls { get; private set; }
+        public TaskCompletionSource Opened { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public int RestartCalls { get; private set; }
-        public Task<bool> TryOpenAsync(CancellationToken token) { OpenCalls++; return Task.FromResult(true); }
+        public Task<bool> TryOpenAsync(CancellationToken token) { OpenCalls++; Opened.TrySetResult(); return Task.FromResult(true); }
         public Task<bool> TryRestartAsync(CancellationToken token) { RestartCalls++; return Task.FromResult(false); }
     }
 }

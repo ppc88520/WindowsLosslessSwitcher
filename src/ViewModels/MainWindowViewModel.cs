@@ -11,12 +11,42 @@ namespace WindowsLosslessSwitcher.ViewModels;
 /// <summary>
 /// Exposes the WPF settings window state and command surface.
 /// </summary>
-public sealed class MainWindowViewModel : INotifyPropertyChanged
+public sealed partial class MainWindowViewModel : INotifyPropertyChanged
 {
     private static readonly int[] SupportedDefaultBitDepths = [16, 24];
     private readonly LocalizationService _localization;
     private Services.SwitchingStatus? _lastStatus;
     private bool _hasNamedActiveDevice;
+    private bool _useDacOnlyOutput;
+    private bool _audioOutputSafetyReady;
+    private string? _audioOutputSafetyDeviceName;
+    private string _audioOutputSafetyDetail = "Connect a supported DAC to enable audio switching.";
+
+    public bool AudioOutputSafetyReady => _audioOutputSafetyReady && !IsDacLockPaused && !IsDacLockBusy;
+    public string AudioOutputSafetyTitleText => _localization[IsDacLockBusy ? "Updating DAC lock" : IsDacLockPaused ? "DAC lock paused" : _audioOutputSafetyReady
+        ? "DAC output ready"
+        : "Waiting for a supported DAC"];
+    public string AudioOutputSafetyDetailText => IsDacLockPaused || IsDacLockBusy
+        ? _localization.TranslateDiagnostic(_dacLockDetail ?? (IsDacLockBusy ? "Finishing current audio work safely." : "You can now choose another speaker in Windows. Automatic switching is paused."))
+        : _audioOutputSafetyReady && !string.IsNullOrWhiteSpace(_audioOutputSafetyDeviceName)
+        ? _localization.Format("Audio switching is limited to {0}.", _audioOutputSafetyDeviceName)
+        : _localization.TranslateDiagnostic(_audioOutputSafetyDetail);
+
+    /// <summary>Updates display-only DAC readiness without issuing audio or playback commands.</summary>
+    public void UpdateAudioOutputSafety(bool ready, string? deviceName, string detail)
+    {
+        _useDacOnlyOutput = true;
+        _audioOutputSafetyReady = ready;
+        _audioOutputSafetyDeviceName = deviceName;
+        _audioOutputSafetyDetail = detail;
+        OnPropertyChanged(nameof(AudioOutputSafetyReady));
+        OnPropertyChanged(nameof(AudioOutputSafetyTitleText));
+        OnPropertyChanged(nameof(AudioOutputSafetyDetailText));
+        OnPropertyChanged(nameof(DeviceModeChipText));
+        OnPropertyChanged(nameof(IsSelectedDeviceSelectionEnabled));
+        OnPropertyChanged(nameof(IsSelectedDeviceSelectionVisible));
+        RaiseDacLockPresentationChanged();
+    }
 
     public PlaybackControlsViewModel Playback { get; } = new();
 
@@ -100,6 +130,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             if (!SetField(ref _isRestartBusy, value)) return;
             RestartToolCommand.RaiseCanExecuteChanged();
             RestartPlayerAndToolCommand.RaiseCanExecuteChanged();
+            DacLockToggleCommand.RaiseCanExecuteChanged();
         }
     }
     public bool HasRecoveryAdvice { get => _hasRecoveryAdvice; private set => SetField(ref _hasRecoveryAdvice, value); }
@@ -128,8 +159,11 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     {
         _localization = localization;
         _localization.LanguageChanged += OnLanguageChanged;
-        RestartToolCommand = new RelayCommand(() => RestartToolRequested?.Invoke(), () => !IsRestartBusy && !Playback.IsBusy);
-        RestartPlayerAndToolCommand = new RelayCommand(() => RestartPlayerAndToolRequested?.Invoke(), () => !IsRestartBusy && !Playback.IsBusy);
+        InitializeDacLockControls();
+        SelectEnglishLanguageCommand = new RelayCommand(() => UiLanguage = "en");
+        SelectTraditionalChineseLanguageCommand = new RelayCommand(() => UiLanguage = "zh-TW");
+        RestartToolCommand = new RelayCommand(() => RestartToolRequested?.Invoke(), () => !IsRestartBusy && !Playback.IsBusy && !IsDacLockBusy);
+        RestartPlayerAndToolCommand = new RelayCommand(() => RestartPlayerAndToolRequested?.Invoke(), () => !IsRestartBusy && !Playback.IsBusy && !IsDacLockBusy && !IsDacLockPaused);
         Playback.PropertyChanged += OnPlaybackPropertyChanged;
         RefreshDevicesCommand = new RelayCommand(() => RefreshRequested?.Invoke());
         ExportDiagnosticsCommand = new RelayCommand(() => ExportDiagnosticsRequested?.Invoke());
@@ -334,7 +368,10 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     public string ActiveTargetDeviceNameText
     {
         get => _hasNamedActiveDevice ? _activeTargetDeviceNameText : _localization[_activeTargetDeviceNameText];
-        set => SetField(ref _activeTargetDeviceNameText, value);
+        set
+        {
+            if (SetField(ref _activeTargetDeviceNameText, value)) OnPropertyChanged(nameof(OutputDeviceDisplayText));
+        }
     }
 
     public string SupportedSampleRatesText
@@ -533,7 +570,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public string PhaseText
     {
-        get => _localization[_phaseText];
+        get => _localization[IsDacLockBusy ? "Updating DAC lock" : IsDacLockPaused ? "Automatic switching paused" : _phaseText];
         private set => SetField(ref _phaseText, value);
     }
 
@@ -574,7 +611,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     /// <summary>"was 24-bit / 44.1 kHz" or "format carried over unchanged" under the hero readout.</summary>
     public string WasLine
     {
-        get => _localization[_wasLine];
+        get => _localization[IsDacLockPaused ? "Last DAC format" : _wasLine];
         private set => SetField(ref _wasLine, value);
     }
 
@@ -599,7 +636,8 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
     }
 
     public string DeviceModeChipText =>
-        _localization[SelectedMode == DeviceSelectionMode.PinnedDevice ? "Pinned" : "Follows default"];
+        _localization[IsDacLockBusy ? "Updating" : IsDacLockPaused ? "Lock paused" : _useDacOnlyOutput ? "DAC only" :
+            SelectedMode == DeviceSelectionMode.PinnedDevice ? "Pinned" : "Follows default"];
 
     public string AllowedFormatsNoteText =>
         _localization[SampleRateOptions.All(option => option.IsChecked) && BitDepthOptions.All(option => option.IsChecked)
@@ -613,9 +651,9 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
 
     public bool UseFixedBitDepthSelection => !SwitchBitDepth;
 
-    public bool IsSelectedDeviceSelectionEnabled => SelectedMode == DeviceSelectionMode.PinnedDevice;
+    public bool IsSelectedDeviceSelectionEnabled => !_useDacOnlyOutput && SelectedMode == DeviceSelectionMode.PinnedDevice;
 
-    public bool IsSelectedDeviceSelectionVisible => SelectedMode == DeviceSelectionMode.PinnedDevice;
+    public bool IsSelectedDeviceSelectionVisible => !_useDacOnlyOutput && SelectedMode == DeviceSelectionMode.PinnedDevice;
 
     public bool IsSwitchToastMetadataOptionVisible => EnableSwitchToasts;
 
@@ -736,6 +774,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
             ? advice.Title
             : phase switch
     {
+        SwitchPhase.Idle when status.ResolverStatusText == "Waiting for a supported DAC" => "Waiting for a supported DAC",
         SwitchPhase.Idle when status.ResolverStatusText == "Resolver: Paused by user" => "Paused — press Play to continue",
         SwitchPhase.Idle => "Watching Apple Music media session",
         SwitchPhase.Detecting => "Track change — output muted",
@@ -1060,6 +1099,7 @@ public sealed class MainWindowViewModel : INotifyPropertyChanged
         if (e.PropertyName != nameof(PlaybackControlsViewModel.IsBusy)) return;
         RestartToolCommand.RaiseCanExecuteChanged();
         RestartPlayerAndToolCommand.RaiseCanExecuteChanged();
+        DacLockToggleCommand.RaiseCanExecuteChanged();
     }
 
     public void DetachLocalization()

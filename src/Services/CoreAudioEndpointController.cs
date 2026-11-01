@@ -1,12 +1,93 @@
 using NAudio.CoreAudioApi;
+using System.Collections.Concurrent;
+using System.Runtime.InteropServices;
+using NAudio.CoreAudioApi.Interfaces;
 using NAudio.Wave;
 using WindowsLosslessSwitcher.Abstractions;
 using WindowsLosslessSwitcher.Models;
 
 namespace WindowsLosslessSwitcher.Services;
 
-public sealed class CoreAudioEndpointController : IAudioEndpointController
+public sealed class CoreAudioEndpointController : IAudioEndpointController, IDefaultAudioDeviceRouter, IAudioDeviceInventory, IDisposable
 {
+    private readonly AudioDeviceInventoryCache _deviceInventory;
+    private readonly object _notificationSync = new();
+    private MMDeviceEnumerator? _notificationEnumerator;
+    private DeviceNotifications? _deviceNotifications;
+    private volatile bool _useCachedInventory;
+    private int _disposed;
+
+    public CoreAudioEndpointController() => _deviceInventory = new AudioDeviceInventoryCache(ReadRenderDevicesUncached);
+    internal void EnableCachedInventory() => _useCachedInventory = true;
+    public long DeviceChangeVersion => _deviceInventory.ChangeVersion;
+    public bool IsDeviceInventoryCurrent => Volatile.Read(ref _disposed) == 0 && _deviceInventory.IsCurrent;
+
+    public void RefreshDeviceInventory(bool forceRefresh = false)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return;
+        lock (_notificationSync)
+        {
+            if (_notificationEnumerator is null)
+            {
+                // Run only on the observer worker. Notification callbacks themselves do
+                // no enumeration, PnP traversal, routing or audio calls.
+                var enumerator = new MMDeviceEnumerator();
+                var notifications = new DeviceNotifications(_deviceInventory);
+                try { Marshal.ThrowExceptionForHR(enumerator.RegisterEndpointNotificationCallback(notifications)); }
+                catch { enumerator.Dispose(); throw; }
+                _deviceNotifications = notifications;
+                _notificationEnumerator = enumerator;
+            }
+        }
+        _deviceInventory.Refresh(forceRefresh);
+    }
+
+    public bool IsDeviceActive(string deviceId)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return false;
+        try { using var device = GetDevice(deviceId); return device.State == DeviceState.Active; }
+        catch { return false; }
+    }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+        _deviceInventory.InvalidateTopology();
+        lock (_notificationSync)
+        {
+            if (_notificationEnumerator is not null)
+            {
+                try { _notificationEnumerator.UnregisterEndpointNotificationCallback(_deviceNotifications!); }
+                catch { }
+                _notificationEnumerator.Dispose();
+                _notificationEnumerator = null;
+                _deviceNotifications = null;
+            }
+        }
+    }
+
+    private sealed class DeviceNotifications(AudioDeviceInventoryCache inventory) : IMMNotificationClient
+    {
+        public void OnDeviceStateChanged(string deviceId, DeviceState newState) => inventory.InvalidateTopology();
+        public void OnDeviceAdded(string deviceId) => inventory.InvalidateTopology();
+        public void OnDeviceRemoved(string deviceId) => inventory.InvalidateTopology();
+        public void OnDefaultDeviceChanged(DataFlow flow, Role role, string defaultDeviceId)
+        {
+            if (flow == DataFlow.Render && role is Role.Console or Role.Multimedia) inventory.InvalidateRouting();
+        }
+        public void OnPropertyValueChanged(string deviceId, PropertyKey key)
+        {
+            // Format/mute properties change during our own processing and do not change
+            // physical identity. Form-factor changes do invalidate hardware eligibility.
+            if (key.Equals(PropertyKeys.PKEY_AudioEndpoint_FormFactor) || key.Equals(PropertyKeys.PKEY_Device_InstanceId))
+                inventory.InvalidateTopology();
+        }
+    }
+    // Installed only by the outer DAC guard. Native multi-call operations revalidate immediately
+    // before every probe/mutation so loss of the output stops an operation already in progress.
+    internal Func<string, bool>? DacOperationAllowed { get; set; }
+    internal Func<string, bool>? DacCleanupAllowed { get; set; }
+
     // Standard PCM sample rates probed via exclusive-mode to build the supported-formats cache.
     // Covers CD (44.1/48 kHz), high-res (88.2/96/176.4/192 kHz), DXD (352.8/384 kHz), and the
     // 705.6/768 kHz ceiling of current XMOS/Thesycon and C-Media DACs (e.g. FiiO KA3/KA5/K17/
@@ -27,21 +108,32 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
     // defines the total window: 5 × 200 ms = 1 000 ms maximum before declaring a failure.
     private static readonly TimeSpan VerificationRetryDelay = TimeSpan.FromMilliseconds(200);
     private readonly object _supportedFormatsSync = new();
+    private readonly ConcurrentDictionary<string, object> _probeLocks = new(StringComparer.Ordinal);
     private readonly Dictionary<string, IReadOnlyList<EndpointFormatDescriptor>> _supportedFormatsCache = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, long> _supportedFormatTopologyVersions = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _lastApplyDiagnostics = new(StringComparer.Ordinal);
     private readonly Dictionary<string, string> _lastProbeDiagnostics = new(StringComparer.Ordinal);
     private readonly Dictionary<string, EndpointFormatKind> _lastSuccessfulKinds = new(StringComparer.Ordinal);
 
     public IReadOnlyList<AudioDeviceInfo> GetRenderDevices()
     {
+        if (Volatile.Read(ref _disposed) != 0) return [];
+        if (!_useCachedInventory) return ReadRenderDevicesUncached();
+        return _deviceInventory.Devices;
+    }
+
+    private IReadOnlyList<AudioDeviceInfo> ReadRenderDevicesUncached()
+    {
         try
         {
             using var enumerator = new MMDeviceEnumerator();
-            using var defaultDevice = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-
-            return enumerator
-                .EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active)
-                .Select(device => new AudioDeviceInfo(device.ID, device.FriendlyName, device.ID == defaultDevice.ID))
+            var defaultId = GetDefaultDeviceId(AudioOutputRole.Multimedia);
+            var devices = new List<AudioDeviceInfo>();
+            foreach (var device in enumerator.EnumerateAudioEndPoints(DataFlow.Render, DeviceState.Active))
+            {
+                using (device) devices.Add(DescribeDevice(device, device.ID == defaultId));
+            }
+            return devices
                 .OrderByDescending(device => device.IsDefault)
                 .ThenBy(device => device.FriendlyName, StringComparer.OrdinalIgnoreCase)
                 .ToList();
@@ -54,16 +146,78 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
 
     public AudioDeviceInfo? GetDefaultRenderDevice()
     {
+        if (Volatile.Read(ref _disposed) != 0) return null;
+        if (_useCachedInventory)
+        {
+            var defaultId = GetDefaultDeviceId(AudioOutputRole.Multimedia);
+            return _deviceInventory.Devices.FirstOrDefault(device => string.Equals(device.Id, defaultId, StringComparison.OrdinalIgnoreCase)) is { } cached
+                ? cached with { IsDefault = true } : null;
+        }
         try
         {
             using var enumerator = new MMDeviceEnumerator();
             using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
-            return new AudioDeviceInfo(device.ID, device.FriendlyName, true);
+            return DescribeDevice(device, true);
         }
         catch
         {
             return null;
         }
+    }
+
+    public string? GetDefaultDeviceId(AudioOutputRole role)
+    {
+        if (Volatile.Read(ref _disposed) != 0) return null;
+        try
+        {
+            if (role is not (AudioOutputRole.Console or AudioOutputRole.Multimedia)) return null;
+            using var enumerator = new MMDeviceEnumerator();
+            using var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, (Role)(int)role);
+            return device.ID;
+        }
+        catch { return null; }
+    }
+
+    public bool TrySetDefaultDeviceId(string deviceId, AudioOutputRole role, out string failureReason)
+    {
+        try
+        {
+            if (role is not (AudioOutputRole.Console or AudioOutputRole.Multimedia) ||
+                !GetRenderDevices().Any(device => string.Equals(device.Id, deviceId, StringComparison.OrdinalIgnoreCase) && DacDeviceIdentity.IsSupportedDac(device)) ||
+                !IsDeviceActive(deviceId))
+            {
+                failureReason = "The selected endpoint is not a connected, verified DAC.";
+                return false;
+            }
+            PolicyConfigInterop.SetDefaultPlaybackEndpoint(deviceId, (int)role);
+            failureReason = string.Empty;
+            return true;
+        }
+        catch (Exception ex) { failureReason = ex.Message; return false; }
+    }
+
+    private static AudioDeviceInfo DescribeDevice(MMDevice device, bool isDefault)
+    {
+        int? formFactor = null;
+        try
+        {
+            if (device.Properties.Contains(PropertyKeys.PKEY_AudioEndpoint_FormFactor))
+                formFactor = Convert.ToInt32(device.Properties[PropertyKeys.PKEY_AudioEndpoint_FormFactor].Value);
+        }
+        catch { }
+        return new AudioDeviceInfo(device.ID, device.FriendlyName, isDefault)
+        {
+            EndpointFormFactor = formFactor,
+            PhysicalUsbDeviceId = DacDeviceIdentity.ReadPhysicalUsbAncestor(device.ID),
+        };
+    }
+
+    private void VerifyDacAccess(string deviceId, bool cleanup = false)
+    {
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+        var allowed = cleanup ? DacCleanupAllowed : DacOperationAllowed;
+        if (allowed is not null && !allowed(deviceId))
+            throw new InvalidOperationException("DAC protection: the selected output is no longer a verified default DAC.");
     }
 
     public AudioFormatCandidate? GetCurrentDeviceFormat(string deviceId)
@@ -82,6 +236,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
     {
         try
         {
+            VerifyDacAccess(deviceId);
             using var device = GetDevice(deviceId);
             var mixFormat = device.AudioClient.MixFormat;
             return new AudioFormatCandidate(mixFormat.SampleRate, EndpointFormatSupport.GetValidBitsPerSample(mixFormat), mixFormat.Channels);
@@ -146,6 +301,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
     {
         try
         {
+            VerifyDacAccess(deviceId);
             using var device = GetDevice(deviceId);
             return device.AudioMeterInformation.MasterPeakValue;
         }
@@ -159,6 +315,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
     {
         try
         {
+            VerifyDacAccess(deviceId);
             using var device = GetDevice(deviceId);
             var manager = device.AudioSessionManager;
             manager.RefreshSessions();
@@ -207,6 +364,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
         // meaningful while the device is muted during a switch.
         try
         {
+            VerifyDacAccess(deviceId);
             using var device = GetDevice(deviceId);
             var manager = device.AudioSessionManager;
             manager.RefreshSessions();
@@ -269,6 +427,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
     {
         try
         {
+            VerifyDacAccess(deviceId);
             using var device = GetDevice(deviceId);
             return device.AudioEndpointVolume.Mute;
         }
@@ -282,7 +441,9 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
     {
         try
         {
+            VerifyDacAccess(deviceId, cleanup: !muted);
             using var device = GetDevice(deviceId);
+            VerifyDacAccess(deviceId, cleanup: !muted);
             device.AudioEndpointVolume.Mute = muted;
             return true;
         }
@@ -313,6 +474,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
             }
 
             beforeFormat = GetCurrentDeviceFormat(deviceId);
+            VerifyDacAccess(deviceId);
             PolicyConfigInterop.SetDeviceFormat(deviceId, descriptor.NativeFormat);
             // Verify against the descriptor's own candidate: the legacy container-bits fallback
             // can select a descriptor whose valid-bits depth differs from the requested format,
@@ -400,24 +562,41 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
 
     private IReadOnlyList<EndpointFormatDescriptor> GetCachedOrProbedDescriptors(string deviceId, bool forceRefresh = false)
     {
-        if (!forceRefresh)
+        VerifyDacAccess(deviceId);
+        IReadOnlyList<EndpointFormatDescriptor>? before;
+        lock (_supportedFormatsSync) _supportedFormatsCache.TryGetValue(deviceId, out before);
+        lock (_probeLocks.GetOrAdd(deviceId, _ => new object()))
         {
+            IReadOnlyList<EndpointFormatDescriptor>? cached = null;
             lock (_supportedFormatsSync)
             {
-                if (_supportedFormatsCache.TryGetValue(deviceId, out var descriptors))
+                if (_supportedFormatsCache.TryGetValue(deviceId, out var descriptors) &&
+                    _supportedFormatTopologyVersions.GetValueOrDefault(deviceId, -1) == _deviceInventory.TopologyVersion &&
+                    (!forceRefresh || !ReferenceEquals(before, descriptors)))
                 {
-                    return descriptors;
+                    cached = descriptors;
                 }
             }
+            if (cached is not null)
+            {
+                VerifyDacAccess(deviceId);
+                return cached;
+            }
+            var topologyVersion = _deviceInventory.TopologyVersion;
+            var changeVersion = DeviceChangeVersion;
+            var probed = ProbeSupportedFormats(deviceId);
+            VerifyDacAccess(deviceId);
+            if (changeVersion != DeviceChangeVersion || topologyVersion != _deviceInventory.TopologyVersion)
+                throw new InvalidOperationException("DAC output changed during capabilities probing.");
+            CacheSupportedFormats(deviceId, probed, topologyVersion);
+            return probed;
         }
-
-        var probed = ProbeSupportedFormats(deviceId);
-        CacheSupportedFormats(deviceId, probed);
-        return probed;
     }
 
     private IReadOnlyList<EndpointFormatDescriptor> ProbeSupportedFormats(string deviceId)
     {
+        VerifyDacAccess(deviceId);
+        var changeVersion = DeviceChangeVersion;
         using var device = GetDevice(deviceId);
         var currentDeviceFormat = EndpointFormatSupport.TryReadPropertyStoreDeviceFormat(device);
         var channels = currentDeviceFormat?.Format.Channels ?? device.AudioClient.MixFormat.Channels;
@@ -431,6 +610,10 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
 
         bool RecordingIsSupported(WaveFormat waveFormat)
         {
+            // Outside the probe-error catch: output loss aborts the entire probe/cache.
+            VerifyDacAccess(deviceId);
+            if (changeVersion != DeviceChangeVersion)
+                throw new InvalidOperationException("DAC output changed during capabilities probing.");
             probeCount++;
             try
             {
@@ -457,6 +640,9 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
             CandidateDepths,
             RecordingIsSupported);
 
+        VerifyDacAccess(deviceId);
+        if (changeVersion != DeviceChangeVersion)
+            throw new InvalidOperationException("DAC output changed during capabilities probing.");
         CacheProbeDiagnostics(deviceId, BuildProbeDiagnostics(currentDeviceFormat, channels, probeCount, acceptedCount, errorCounts, descriptors));
         return descriptors;
     }
@@ -487,11 +673,12 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
             $"acceptedFormats=[{string.Join(" ", acceptedFormats)}], probeErrors={{{errors}}}";
     }
 
-    private void CacheSupportedFormats(string deviceId, IReadOnlyList<EndpointFormatDescriptor> descriptors)
+    private void CacheSupportedFormats(string deviceId, IReadOnlyList<EndpointFormatDescriptor> descriptors, long topologyVersion)
     {
         lock (_supportedFormatsSync)
         {
             _supportedFormatsCache[deviceId] = descriptors;
+            _supportedFormatTopologyVersions[deviceId] = topologyVersion;
         }
     }
 
@@ -505,6 +692,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
 
     private DeviceFormatSnapshot ReadCurrentDeviceFormatSnapshot(string deviceId)
     {
+        VerifyDacAccess(deviceId);
         AudioFormatCandidate? propertyStoreFormat = null;
         AudioFormatCandidate? policyConfigFormat = null;
 
@@ -547,6 +735,7 @@ public sealed class CoreAudioEndpointController : IAudioEndpointController
     {
         try
         {
+            VerifyDacAccess(deviceId);
             using var device = GetDevice(deviceId);
             return EndpointFormatSupport.TryReadPropertyStoreDeviceFormat(device);
         }

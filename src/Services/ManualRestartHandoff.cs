@@ -12,7 +12,7 @@ public sealed record ManualRestartRequest(string Nonce, int ParentPid, long Pare
 /// <summary>Same-executable handoff. No parent kill, shell commands, navigation, or Play.</summary>
 public static class ManualRestartHandoff
 {
-    public const string ApplicationName = "Windows Lossless Switcher";
+    public const string ApplicationName = TestBuildProfile.DisplayName;
     internal static string ProfileIdentity => Path.GetFileName(AppDataPaths.RootDirectory);
     internal static bool IsSupportedExecutable(string path) => string.Equals(Path.GetFileName(path),
         typeof(Program).Assembly.GetName().Name + ".exe", StringComparison.OrdinalIgnoreCase);
@@ -127,8 +127,23 @@ public static class ManualRestartHandoff
                 }
                 logger.Warn("Manual restart aborted: old process did not exit. It was not killed or relaunched.");
                 return false;
-            }, async () => await Task.Run(() => new AppleMusicProcessController(logger).TryRestartAsync(CancellationToken.None))
-                    .WaitAsync(TimeSpan.FromSeconds(45)), playerSucceeded =>
+            }, async () => await Task.Run(async () =>
+            {
+                // The helper is a separate process: never trust readiness observed before
+                // the parent exited, and never route or probe an output from this helper.
+                var core = new CoreAudioEndpointController();
+                using var guard = new DacOnlyAudioEndpointController(core, core);
+                guard.SetRoutingPaused(TestBuildProfile.ReadSavedDacLockPaused());
+                core.RefreshDeviceInventory();
+                if (!guard.IsReady)
+                {
+                    logger.Warn("DAC protection: Apple Music restart was stopped because the DAC output is unavailable.");
+                    return false;
+                }
+                return await new DacGuardedAppleMusicProcessController(
+                    new AppleMusicProcessController(logger, () => guard.IsReady), () => guard.IsReady)
+                    .TryRestartAsync(CancellationToken.None);
+            }).WaitAsync(TimeSpan.FromSeconds(45)), playerSucceeded =>
             {
                 var start = new ProcessStartInfo(executable) { UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = Path.GetDirectoryName(executable)! };
                 start.ArgumentList.Add(StartupArgument);

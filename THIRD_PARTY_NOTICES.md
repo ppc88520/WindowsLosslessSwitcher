@@ -16,6 +16,7 @@ Windows Lossless Switcher is licensed under `GPL-3.0-or-later` (see [LICENSE](LI
 | Component | License | Source |
 | --------- | ------- | ------ |
 | [Inter](https://github.com/rsms/inter) font (Regular, Medium — `src/Assets/Fonts/`) | [SIL OFL 1.1](src/Assets/Fonts/Inter-LICENSE.txt) | rsms/inter v4.1 |
+| [Noto Sans CJK TC](https://github.com/notofonts/noto-cjk) font (unmodified static Regular, Medium — `src/Assets/Fonts/`) | [SIL OFL 1.1](src/Assets/Fonts/NotoSansCJK-LICENSE.txt) | notofonts/noto-cjk revision `f8d157532fbfaeda587e826d4cd5b21a49186f7c`; exact source URLs and SHA-256 in `src/Assets/Fonts/NotoSansCJK-provenance.json` |
 | [Phosphor Icons](https://github.com/phosphor-icons/core) (vector path data for 18 regular-weight glyphs in `src/Themes/Nocturne.Icons.xaml`) | [MIT](https://github.com/phosphor-icons/core/blob/main/LICENSE) | phosphor-icons/core |
 
 ## Build-time only

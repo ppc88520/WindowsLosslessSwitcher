@@ -1,0 +1,17 @@
+<FontFamily xmlns="http://schemas.microsoft.com/winfx/2006/xaml/composite-font"
+            xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+            xmlns:sys="clr-namespace:System;assembly=mscorlib">
+  <FontFamily.FamilyNames>
+    <sys:String x:Key="en-US">Nocturne UI</sys:String>
+    <sys:String x:Key="zh-TW">Nocturne UI</sys:String>
+  </FontFamily.FamilyNames>
+  <FontFamily.FamilyMaps>
+    <!-- CJK uses the Traditional Chinese regional glyph forms, in every UI language.
+         Latin text, numerals and the original author's type hierarchy remain Inter. -->
+    <FontFamilyMap Unicode="2E80-2FFF,3000-30FF,3100-312F,31A0-31FF,3200-33FF,3400-4DBF,4E00-9FFF,F900-FAFF,FE10-FE1F,FE30-FE4F,FF00-FFEF,20000-2FA1F,30000-323AF"
+                   Scale="1.06"
+                   Target="./#Noto Sans CJK TC, Microsoft JhengHei UI, Microsoft JhengHei" />
+    <FontFamilyMap Unicode="0000-10FFFF"
+                   Target="./#Inter, Segoe UI Variable Text, Segoe UI, ./#Noto Sans CJK TC, Microsoft JhengHei UI" />
+  </FontFamily.FamilyMaps>
+</FontFamily>

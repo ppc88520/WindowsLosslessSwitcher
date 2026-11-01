@@ -14,16 +14,22 @@
     <UseWindowsForms>true</UseWindowsForms>
     <EnableDefaultApplicationDefinition>false</EnableDefaultApplicationDefinition>
     <RootNamespace>WindowsLosslessSwitcher</RootNamespace>
-    <AssemblyName>WindowsLosslessSwitcher</AssemblyName>
+    <AssemblyName>WindowsLosslessSwitcher.DacGuardTest</AssemblyName>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
     <ApplicationIcon>Assets\WLS.ico</ApplicationIcon>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
     <StartupObject>WindowsLosslessSwitcher.Program</StartupObject>
     <GenerateDocumentationFile>true</GenerateDocumentationFile>
     <NoWarn>$(NoWarn);1591</NoWarn>
+    <!-- WPF owns the process bootstrap; WinForms is used only for NotifyIcon interop.
+         Keep the manifest's PerMonitorV2 context established before any HWND exists.
+         WFAC010 assumes a WinForms ApplicationConfiguration.Initialize bootstrap,
+         which this application does not use. Suppress that specific interop mismatch. -->
+    <NoWarn Condition="'$(UseWPF)' == 'true' And '$(UseWindowsForms)' == 'true'">$(NoWarn);WFAC010</NoWarn>
     <WlsAppVersion Condition="'$(APP_VERSION)' != ''">$(APP_VERSION)</WlsAppVersion>
-    <WlsAppVersion Condition="'$(WlsAppVersion)' == ''">0.1.0</WlsAppVersion>
+    <WlsAppVersion Condition="'$(WlsAppVersion)' == ''">1.0.0-beta.7-dac0.3</WlsAppVersion>
     <WlsAssemblyVersion Condition="'$(ASSEMBLY_VERSION)' != ''">$(ASSEMBLY_VERSION)</WlsAssemblyVersion>
-    <WlsAssemblyVersion Condition="'$(WlsAssemblyVersion)' == ''">0.1.0.0</WlsAssemblyVersion>
+    <WlsAssemblyVersion Condition="'$(WlsAssemblyVersion)' == ''">1.0.0.7303</WlsAssemblyVersion>
     <Version>$(WlsAppVersion)</Version>
     <AssemblyVersion>$(WlsAssemblyVersion)</AssemblyVersion>
     <FileVersion>$(WlsAssemblyVersion)</FileVersion>
@@ -66,6 +72,11 @@
     <Resource Include="Assets\WLS.ico" />
     <Resource Include="Assets\Fonts\Inter-Regular.ttf" />
     <Resource Include="Assets\Fonts\Inter-Medium.ttf" />
+    <Resource Include="Assets\Fonts\NotoSansCJKtc-Regular.otf" />
+    <Resource Include="Assets\Fonts\NotoSansCJKtc-Medium.otf" />
+    <Resource Include="Assets\Fonts\Nocturne.CompositeFont" />
     <None Include="Assets\Fonts\Inter-LICENSE.txt" />
+    <None Include="Assets\Fonts\NotoSansCJK-LICENSE.txt" />
+    <None Include="Assets\Fonts\NotoSansCJK-provenance.json" />
   </ItemGroup>
 </Project>

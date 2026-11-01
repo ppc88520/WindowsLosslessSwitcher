@@ -19,10 +19,12 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
     private static readonly TimeSpan ProcessPollInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly DiagnosticsLogger _logger;
+    private readonly Func<bool>? _restartOutputReady;
 
-    public AppleMusicProcessController(DiagnosticsLogger logger)
+    public AppleMusicProcessController(DiagnosticsLogger logger, Func<bool>? restartOutputReady = null)
     {
         _logger = logger;
+        _restartOutputReady = restartOutputReady;
     }
 
     public async Task<bool> TryRestartAsync(CancellationToken cancellationToken)
@@ -33,9 +35,11 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
 
         try
         {
+            EnsureRestartOutputReady();
             await CloseAppleMusicAsync();
+            EnsureRestartOutputReady();
             KillSurvivingMediaAgent();
-            return await RelaunchAppleMusicAsync();
+            return await RelaunchAppleMusicAsync(outputReady: _restartOutputReady);
         }
         catch (Exception ex)
         {
@@ -101,8 +105,10 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
         {
             foreach (var process in processes)
             {
+                EnsureRestartOutputReady();
                 if (process.MainWindowHandle != IntPtr.Zero && !TryCloseViaUiAutomation(process.MainWindowHandle))
                 {
+                    EnsureRestartOutputReady();
                     process.CloseMainWindow();
                 }
             }
@@ -121,6 +127,7 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
 
             foreach (var process in processes.Where(process => !process.HasExited))
             {
+                EnsureRestartOutputReady();
                 _logger.Warn("Apple Music did not close gracefully; killing the process.");
                 process.Kill();
             }
@@ -141,6 +148,7 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
             var window = AutomationElement.FromHandle(mainWindowHandle);
             if (window.GetCurrentPattern(WindowPattern.Pattern) is WindowPattern windowPattern)
             {
+                EnsureRestartOutputReady();
                 windowPattern.Close();
                 return true;
             }
@@ -163,6 +171,7 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
         {
             try
             {
+                EnsureRestartOutputReady();
                 _logger.Info("Killing the surviving media agent so the relaunch gets a fresh renderer.");
                 agent.Kill();
             }
@@ -177,9 +186,16 @@ public sealed class AppleMusicProcessController : IAppleMusicProcessController
         }
     }
 
-    private async Task<bool> RelaunchAppleMusicAsync(CancellationToken cancellationToken = default)
+    private void EnsureRestartOutputReady()
+    {
+        if (_restartOutputReady is not null && !_restartOutputReady())
+            throw new InvalidOperationException("DAC output was lost. Apple Music restart was stopped.");
+    }
+
+    private async Task<bool> RelaunchAppleMusicAsync(CancellationToken cancellationToken = default, Func<bool>? outputReady = null)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        if (outputReady is not null && !outputReady()) return false;
         using var launcher = Process.Start(new ProcessStartInfo
         {
             FileName = $"shell:AppsFolder\\{AppleMusicPaths.PackageFamilyName}!App",

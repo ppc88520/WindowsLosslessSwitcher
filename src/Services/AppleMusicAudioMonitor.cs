@@ -44,6 +44,12 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
     private readonly ISpectrographCaptureFactory _captureFactory;
     private readonly Func<int?> _pidResolver;
     private readonly bool _keepSessionForProcessLifetime;
+    private readonly Func<bool>? _audioOutputReady;
+    private readonly bool _backgroundWork;
+    private int _backgroundRequested;
+    private int _backgroundScheduled;
+    private bool _backgroundVisible;
+    private bool _outputBlocked;
     private readonly HashSet<int> _burntPids = [];
     private readonly SpectrumAnalyzer _analyzer = new();
     private readonly object _sync = new();
@@ -57,7 +63,7 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
     private bool _faulted;
     private bool _faultLogged;
     private bool _playbackIdle;
-    private bool _disposed;
+    private volatile bool _disposed;
     private TimeSpan _backoff = MinBackoff;
     private DateTimeOffset _sessionStartedAt;
     private DateTimeOffset _lastPlayingAt = DateTimeOffset.MinValue;
@@ -66,13 +72,16 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
 
     public AppleMusicAudioMonitor(
         DiagnosticsLogger logger,
-        IMediaTransportController transport)
+        IMediaTransportController transport,
+        Func<bool>? audioOutputReady = null)
         : this(
             logger,
             transport,
             new ProcessLoopbackCaptureFactory(),
             ResolveAppleMusicAudioPid,
-            keepSessionForProcessLifetime: Environment.OSVersion.Version.Build < 22000)
+            keepSessionForProcessLifetime: Environment.OSVersion.Version.Build < 22000,
+            audioOutputReady: audioOutputReady,
+            backgroundWork: true)
     {
     }
 
@@ -81,13 +90,17 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
         IMediaTransportController transport,
         ISpectrographCaptureFactory captureFactory,
         Func<int?> pidResolver,
-        bool keepSessionForProcessLifetime = false)
+        bool keepSessionForProcessLifetime = false,
+        Func<bool>? audioOutputReady = null,
+        bool backgroundWork = false)
     {
         _logger = logger;
         _transport = transport;
         _captureFactory = captureFactory;
         _pidResolver = pidResolver;
         _keepSessionForProcessLifetime = keepSessionForProcessLifetime;
+        _audioOutputReady = audioOutputReady;
+        _backgroundWork = backgroundWork;
     }
 
     public float[] CurrentBars => _analyzer.LatestBars;
@@ -96,6 +109,13 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
 
     public IDisposable AcquireVisibleLease()
     {
+        if (_backgroundWork)
+        {
+            if (_disposed) return EmptyLease.Instance;
+            Interlocked.Increment(ref _leaseCount);
+            RequestBackgroundRefresh();
+            return new Lease(this);
+        }
         lock (_sync)
         {
             if (_disposed)
@@ -121,6 +141,12 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
 
     private void ReleaseLease()
     {
+        if (_backgroundWork)
+        {
+            Interlocked.Decrement(ref _leaseCount);
+            RequestBackgroundRefresh();
+            return;
+        }
         lock (_sync)
         {
             if (_disposed || _leaseCount == 0)
@@ -145,7 +171,7 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
 
     private void EnsureCaptureStartedLocked()
     {
-        if (_disposed || _faulted || _playbackIdle || _leaseCount == 0 || _session is not null)
+        if (_disposed || !IsOutputReady() || _faulted || _playbackIdle || _leaseCount == 0 || _session is not null)
         {
             return;
         }
@@ -167,7 +193,9 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
 
         try
         {
+            if (!IsOutputReady()) return;
             var session = _captureFactory.Create(pid.Value, _analyzer.ProcessSamples, OnStreamFailed);
+            if (!IsOutputReady() || _disposed || Volatile.Read(ref _leaseCount) <= 0) { session.Dispose(); return; }
             session.Start();
             _session = session;
             _sessionPid = pid.Value;
@@ -272,6 +300,8 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
                 return;
             }
 
+            if (!RefreshOutputSafetyLocked()) return;
+
             var now = DateTimeOffset.UtcNow;
             if (playing)
             {
@@ -324,6 +354,87 @@ public sealed class AppleMusicAudioMonitor : ISpectrumSource, IDisposable
                 // via the retry timer only; nothing to do here.
             }
         }
+    }
+
+    private bool IsOutputReady()
+    {
+        try { return _audioOutputReady?.Invoke() ?? true; }
+        catch { return false; }
+    }
+
+    /// <summary>Stops loopback capture when the validated DAC route is lost.</summary>
+    public void RefreshOutputSafety()
+    {
+        if (_backgroundWork) { RequestBackgroundRefresh(); return; }
+        lock (_sync)
+        {
+            if (!_disposed) RefreshOutputSafetyLocked();
+        }
+    }
+
+    // Public visibility/safety requests never take the capture lock or call a native API.
+    // Slow creation/disposal is confined to this coalesced worker and the existing timer workers.
+    private void RequestBackgroundRefresh()
+    {
+        if (_disposed) return;
+        Interlocked.Exchange(ref _backgroundRequested, 1);
+        if (Interlocked.CompareExchange(ref _backgroundScheduled, 1, 0) != 0) return;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                while (Interlocked.Exchange(ref _backgroundRequested, 0) != 0)
+                {
+                    lock (_sync)
+                    {
+                        if (_disposed) return;
+                        if (Volatile.Read(ref _leaseCount) <= 0)
+                        {
+                            _backgroundVisible = false;
+                            _pollTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                            _retryTimer?.Change(Timeout.Infinite, Timeout.Infinite);
+                            if (!_keepSessionForProcessLifetime) { StopCaptureLocked(); _analyzer.Reset(); }
+                            continue;
+                        }
+                        if (!_backgroundVisible)
+                        {
+                            _backgroundVisible = true;
+                            _faulted = false;
+                            _consecutiveFailures = 0;
+                            _backoff = MinBackoff;
+                            _playbackIdle = false;
+                            _pollTimer ??= new Timer(_ => OnPollTick(), null, Timeout.Infinite, Timeout.Infinite);
+                            _pollTimer.Change(TimeSpan.Zero, TimeSpan.FromSeconds(1));
+                        }
+                        if (RefreshOutputSafetyLocked()) EnsureCaptureStartedLocked();
+                    }
+                }
+            }
+            catch (Exception ex) { _logger.Warn("Spectrograph background refresh failed: " + ex.Message); }
+            finally
+            {
+                Interlocked.Exchange(ref _backgroundScheduled, 0);
+                if (!_disposed && Volatile.Read(ref _backgroundRequested) != 0) RequestBackgroundRefresh();
+            }
+        });
+    }
+
+    private bool RefreshOutputSafetyLocked()
+    {
+        if (!IsOutputReady())
+        {
+            _outputBlocked = true;
+            StopCaptureLocked();
+            _analyzer.Reset();
+            return false;
+        }
+        if (_outputBlocked)
+        {
+            _outputBlocked = false;
+            _playbackIdle = false;
+            EnsureCaptureStartedLocked();
+        }
+        return true;
     }
 
     /// <summary>

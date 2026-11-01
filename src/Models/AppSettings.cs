@@ -36,6 +36,9 @@ public sealed class AppSettings
 
     public string? PinnedDeviceId { get; set; }
 
+    /// <summary>Temporarily releases automatic DAC routing until explicitly resumed.</summary>
+    public bool DacLockPaused { get; set; }
+
     public bool LaunchAtLogin { get; set; }
 
     public bool SwitchBitDepth { get; set; } = true;

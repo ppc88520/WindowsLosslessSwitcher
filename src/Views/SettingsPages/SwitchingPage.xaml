@@ -14,11 +14,17 @@
         <Binding Path="[Language]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
       </TextBlock.Text>
     </TextBlock>
-    <ComboBox Margin="0,8,0,0" Width="220" MinHeight="34" Padding="8,5" HorizontalAlignment="Left" Background="#FFF1F2F7" Foreground="#FF222333" ItemsSource="{Binding UiLanguageOptions}" SelectedValue="{Binding UiLanguage, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" SelectedValuePath="Code" DisplayMemberPath="DisplayName">
-      <AutomationProperties.Name>
-        <Binding Path="[Language]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
-      </AutomationProperties.Name>
-    </ComboBox>
+    <Border Margin="0,8,0,0" HorizontalAlignment="Left" Background="{StaticResource Nocturne.Brush.Recessed}"
+            BorderBrush="{StaticResource Nocturne.Brush.Hover}" BorderThickness="1" CornerRadius="8" Padding="3">
+      <StackPanel Orientation="Horizontal">
+        <RadioButton GroupName="UiLanguage" Content="English" AutomationProperties.Name="English" MinWidth="100"
+                     Command="{Binding SelectEnglishLanguageCommand}" Style="{StaticResource Nocturne.SegmentedOption}"
+                     IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={StaticResource EqualityToBool}, ConverterParameter=en}" />
+        <RadioButton GroupName="UiLanguage" Content="繁體中文" AutomationProperties.Name="繁體中文" MinWidth="100"
+                     Command="{Binding SelectTraditionalChineseLanguageCommand}" Style="{StaticResource Nocturne.SegmentedOption}"
+                     IsChecked="{Binding UiLanguage, Mode=OneWay, Converter={StaticResource EqualityToBool}, ConverterParameter=zh-TW}" />
+      </StackPanel>
+    </Border>
     <TextBlock Margin="0,6,0,0" FontSize="{StaticResource Nocturne.FontSize.Note}" Foreground="{StaticResource Nocturne.Brush.Text45}" TextWrapping="Wrap">
       <TextBlock.Text>
         <Binding Path="[Applies immediately. Playback and the Apple Music storefront are unchanged.]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
@@ -27,65 +33,38 @@
     <Control Margin="0,16,0,0" Style="{StaticResource Nocturne.Divider}" />
     <TextBlock Margin="0,16,0,0" Style="{StaticResource Nocturne.Kicker}">
       <controls:Tracking.Text>
-        <Binding Path="[DEVICE MODE]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+        <Binding Path="[DAC Lock]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
       </controls:Tracking.Text>
     </TextBlock>
-    <Border Margin="0,8,0,0" HorizontalAlignment="Left" Background="{StaticResource Nocturne.Brush.Recessed}" BorderBrush="{StaticResource Nocturne.Brush.Hover}" BorderThickness="1" CornerRadius="8" Padding="3">
-      <StackPanel Orientation="Horizontal">
-        <RadioButton GroupName="DeviceMode" IsChecked="{Binding SelectedMode, Converter={StaticResource EqualityToBool}, ConverterParameter=FollowDefault}" Style="{StaticResource Nocturne.SegmentedOption}">
-          <RadioButton.Content>
-            <Binding Path="[Follow default device]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
-          </RadioButton.Content>
-        </RadioButton>
-        <RadioButton GroupName="DeviceMode" IsChecked="{Binding SelectedMode, Converter={StaticResource EqualityToBool}, ConverterParameter=PinnedDevice}" Style="{StaticResource Nocturne.SegmentedOption}">
-          <RadioButton.Content>
-            <Binding Path="[Pin a device]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
-          </RadioButton.Content>
-        </RadioButton>
+    <Border Margin="0,8,0,0" Padding="12" CornerRadius="8" Background="{StaticResource Nocturne.Brush.Recessed}" BorderBrush="{StaticResource Nocturne.Brush.Ring}" BorderThickness="1">
+      <StackPanel>
+        <TextBlock Text="{Binding AudioOutputSafetyTitleText}" FontSize="{StaticResource Nocturne.FontSize.Body}" FontWeight="Medium" TextWrapping="Wrap" />
+        <TextBlock Margin="0,6,0,0" Text="{Binding AudioOutputSafetyDetailText}" FontSize="{StaticResource Nocturne.FontSize.Secondary}" TextWrapping="Wrap" Foreground="{StaticResource Nocturne.Brush.Text70}" />
+        <Button Margin="0,10,0,0" Padding="12,6" HorizontalAlignment="Left" Command="{Binding DacLockToggleCommand}"
+                Content="{Binding DacLockToggleText}" ToolTip="{Binding DacLockHelpText}" AutomationProperties.Name="{Binding DacLockToggleText}"
+                Style="{StaticResource Nocturne.Button.Ghost}" />
       </StackPanel>
     </Border>
-    <StackPanel Margin="0,10,0,0" Visibility="{Binding IsSelectedDeviceSelectionVisible, Converter={StaticResource BoolToVisibility}}">
-      <ListBox ItemsSource="{Binding Devices}" SelectedValue="{Binding SelectedDeviceId}" SelectedValuePath="Id" Style="{StaticResource Nocturne.DeviceList}">
-        <ListBox.ItemTemplate>
-          <DataTemplate>
-            <StackPanel Orientation="Horizontal">
-              <Grid Width="14" Height="14" VerticalAlignment="Center">
-                <Ellipse Width="14" Height="14">
-                  <Ellipse.Style>
-                    <Style TargetType="Ellipse">
-                      <Setter Property="Fill" Value="Transparent" />
-                      <Style.Triggers>
-                        <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
-                          <Setter Property="Fill" Value="{StaticResource Nocturne.Brush.AccentTint}" />
-                        </DataTrigger>
-                      </Style.Triggers>
-                    </Style>
-                  </Ellipse.Style>
-                </Ellipse>
-                <Ellipse Width="8" Height="8">
-                  <Ellipse.Style>
-                    <Style TargetType="Ellipse">
-                      <Setter Property="Fill" Value="{StaticResource Nocturne.Brush.Ring}" />
-                      <Style.Triggers>
-                        <DataTrigger Binding="{Binding IsSelected, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" Value="True">
-                          <Setter Property="Fill" Value="{StaticResource Nocturne.Brush.Accent}" />
-                        </DataTrigger>
-                      </Style.Triggers>
-                    </Style>
-                  </Ellipse.Style>
-                </Ellipse>
-              </Grid>
-              <TextBlock Margin="10,0,0,0" VerticalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.Control}" Text="{Binding FriendlyName}" />
-            </StackPanel>
-          </DataTemplate>
-        </ListBox.ItemTemplate>
-      </ListBox>
-      <Button Margin="0,2,0,0" HorizontalAlignment="Left" Command="{Binding RefreshDevicesCommand}" FontSize="{StaticResource Nocturne.FontSize.Secondary}" Padding="10,5" Style="{StaticResource Nocturne.Button.Ghost}">
-        <Button.Content>
-          <Binding Path="[Refresh devices]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
-        </Button.Content>
-      </Button>
-    </StackPanel>
+    <TextBlock Margin="0,10,0,0" FontSize="{StaticResource Nocturne.FontSize.Body}" TextWrapping="Wrap">
+      <TextBlock.Text>
+        <Binding Path="[DAC-only output — automatic selection]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+      </TextBlock.Text>
+    </TextBlock>
+    <TextBlock Margin="0,6,0,0" FontSize="{StaticResource Nocturne.FontSize.Small}" Foreground="{StaticResource Nocturne.Brush.Text55}" TextWrapping="Wrap">
+      <TextBlock.Text>
+        <Binding Path="[When the supported DAC is connected^, this test sets it as the Windows default playback output. Communications output stays unchanged. Audio switching waits until the change is confirmed.]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+      </TextBlock.Text>
+    </TextBlock>
+    <TextBlock Margin="0,6,0,0" FontSize="{StaticResource Nocturne.FontSize.Small}" Foreground="{StaticResource Nocturne.Brush.Text55}" TextWrapping="Wrap">
+      <TextBlock.Text>
+        <Binding Path="[Supported in this test: TOPPING DX1 II USB DAC. Monitor speakers^, built-in audio^, virtual devices and unrecognized DACs remain blocked.]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+      </TextBlock.Text>
+    </TextBlock>
+    <Button Margin="0,10,0,0" HorizontalAlignment="Left" Command="{Binding RefreshDevicesCommand}" FontSize="{StaticResource Nocturne.FontSize.Secondary}" Padding="10,5" Style="{StaticResource Nocturne.Button.Ghost}">
+      <Button.Content>
+        <Binding Path="[Refresh devices]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
+      </Button.Content>
+    </Button>
     <Control Margin="0,20,0,0" Style="{StaticResource Nocturne.Divider}" />
     <StackPanel Margin="0,8,0,0">
       <Grid Margin="0,10,0,10">
@@ -176,7 +155,7 @@
             <Binding Path="[Launch at login]" Source="{x:Static services:LocalizationService.Current}" Mode="OneWay" />
           </TextBlock.Text>
         </TextBlock>
-        <ToggleButton HorizontalAlignment="Right" VerticalAlignment="Center" IsChecked="{Binding LaunchAtLogin}" Style="{StaticResource Nocturne.ToggleSwitch}"></ToggleButton>
+        <ToggleButton HorizontalAlignment="Right" VerticalAlignment="Center" IsEnabled="False" IsChecked="{Binding LaunchAtLogin}" Style="{StaticResource Nocturne.ToggleSwitch}"></ToggleButton>
       </Grid>
     </StackPanel>
     <TextBlock Margin="0,10,0,0" Style="{StaticResource Nocturne.Kicker}">
@@ -241,7 +220,7 @@
           </TextBlock.Text>
         </TextBlock>
       </StackPanel>
-      <ToggleButton Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center" IsChecked="{Binding RestartAppleMusicOnPlaybackFailure}" Style="{StaticResource Nocturne.ToggleSwitch}"></ToggleButton>
+      <ToggleButton Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center" IsEnabled="False" IsChecked="{Binding RestartAppleMusicOnPlaybackFailure}" Style="{StaticResource Nocturne.ToggleSwitch}"></ToggleButton>
     </Grid>
     <Grid Margin="0,10,0,10">
       <TextBlock VerticalAlignment="Center" FontSize="{StaticResource Nocturne.FontSize.Body}" TextWrapping="Wrap">

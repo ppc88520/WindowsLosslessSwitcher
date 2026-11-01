@@ -5,7 +5,6 @@ using Button = System.Windows.Controls.Button;
 using Orientation = System.Windows.Controls.Orientation;
 using Color = System.Windows.Media.Color;
 using Brushes = System.Windows.Media.Brushes;
-using FontFamily = System.Windows.Media.FontFamily;
 
 namespace WindowsLosslessSwitcher.Services;
 
@@ -37,10 +36,14 @@ public static class LocalizedDialog
             WindowStartupLocation = WindowStartupLocation.CenterScreen,
             Background = new SolidColorBrush(Color.FromRgb(27, 30, 38)),
             Foreground = Brushes.WhiteSmoke,
-            FontFamily = new FontFamily("Segoe UI, Microsoft JhengHei UI"),
+            FontFamily = UiTypography.FontFamily,
             FontSize = 14,
+            UseLayoutRounding = true,
+            SnapsToDevicePixels = true,
             ShowInTaskbar = true,
         };
+        TextOptions.SetTextFormattingMode(window, TextFormattingMode.Ideal);
+        TextOptions.SetTextRenderingMode(window, TextRenderingMode.Grayscale);
         var panel = new StackPanel { Margin = new Thickness(24) };
         panel.Children.Add(new TextBlock { Text = strings[message], TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 22) });
         var actions = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = System.Windows.HorizontalAlignment.Right };

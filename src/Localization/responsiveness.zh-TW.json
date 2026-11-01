@@ -1,0 +1,4 @@
+{
+  "Exit did not complete": "結束程式未完成",
+  "Pause Apple Music and retry Exit. Native cleanup did not complete: {0}": "請先暫停 Apple Music，再重試結束程式。音訊清理尚未完成：{0}"
+}

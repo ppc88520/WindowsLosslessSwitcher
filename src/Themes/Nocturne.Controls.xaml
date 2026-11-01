@@ -2,8 +2,8 @@
                     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
 
   <ResourceDictionary.MergedDictionaries>
-    <ResourceDictionary Source="/Themes/Nocturne.Colors.xaml" />
-    <ResourceDictionary Source="/Themes/Nocturne.Typography.xaml" />
+    <ResourceDictionary Source="Nocturne.Colors.xaml" />
+    <ResourceDictionary Source="Nocturne.Typography.xaml" />
   </ResourceDictionary.MergedDictionaries>
 
   <!-- ═══ Focus ═══ -->

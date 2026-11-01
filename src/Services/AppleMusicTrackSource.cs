@@ -88,6 +88,15 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
     public event EventHandler<TrackSnapshot>? TrackChanged;
     public event EventHandler<MediaTransportState>? PlaybackStateChanged;
 
+    /// <summary>Checked immediately before commands that can start or navigate audio.</summary>
+    public Func<bool>? AudioOutputReady { get; init; }
+
+    private bool CanDispatchAudioCommand()
+    {
+        try { return AudioOutputReady?.Invoke() ?? true; }
+        catch { return false; }
+    }
+
     public async Task StartAsync(CancellationToken cancellationToken)
     {
         try
@@ -303,7 +312,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await BoundedMediaCommand.InvokeAsync(ct => session.TryPlayAsync().AsTask(ct), "Play", cancellationToken);
+            return await BoundedMediaCommand.InvokeAsync(ct => CanDispatchAudioCommand()
+                ? session.TryPlayAsync().AsTask(ct) : Task.FromResult(false), "Play", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -336,7 +346,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await BoundedMediaCommand.InvokeAsync(ct => session.TryTogglePlayPauseAsync().AsTask(ct), "Toggle", cancellationToken);
+            return await BoundedMediaCommand.InvokeAsync(ct => CanDispatchAudioCommand()
+                ? session.TryTogglePlayPauseAsync().AsTask(ct) : Task.FromResult(false), "Toggle", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -369,7 +380,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await BoundedMediaCommand.InvokeAsync(ct => session.TryChangePlaybackPositionAsync(position.Ticks).AsTask(ct), "Seek", cancellationToken);
+            return await BoundedMediaCommand.InvokeAsync(ct => CanDispatchAudioCommand()
+                ? session.TryChangePlaybackPositionAsync(position.Ticks).AsTask(ct) : Task.FromResult(false), "Seek", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -402,7 +414,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 return false;
             }
 
-            return await BoundedMediaCommand.InvokeAsync(ct => session.TrySkipNextAsync().AsTask(ct), "Next", cancellationToken);
+            return await BoundedMediaCommand.InvokeAsync(ct => CanDispatchAudioCommand()
+                ? session.TrySkipNextAsync().AsTask(ct) : Task.FromResult(false), "Next", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -437,7 +450,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
 
             // Previous semantics are player-defined and can navigate to another item. Automatic
             // restart uses the separate guarded path; this method remains the ordinary UI control.
-            return await BoundedMediaCommand.InvokeAsync(ct => session.TrySkipPreviousAsync().AsTask(ct), "Previous", cancellationToken);
+            return await BoundedMediaCommand.InvokeAsync(ct => CanDispatchAudioCommand()
+                ? session.TrySkipPreviousAsync().AsTask(ct) : Task.FromResult(false), "Previous", cancellationToken);
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
@@ -456,8 +470,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
         TrackSnapshot? precedingTrack,
         CancellationToken cancellationToken)
     {
-        if (_disposed)
-            return new(false, false, "Track source is disposed; Previous was not sent.");
+        if (_disposed || !CanDispatchAudioCommand())
+            return new(false, false, "Track source is disposed or DAC output is unavailable; Previous was not sent.");
         await _previousRestartGate.WaitAsync(cancellationToken);
         CapturedPreviousSession? captured = null;
         PreviousRestartSnapshot? finalSnapshot = null;
@@ -1374,10 +1388,11 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
             _beforePrevious = fresh;
             // This narrows the read/dispatch gap; GSMTC still cannot atomically bind a navigation
             // command to a media-item identity, so post-command verification remains essential.
-            if (!IsCapturedSession() || NavigationChanged())
+            if (!IsCapturedSession() || NavigationChanged() || !_owner.CanDispatchAudioCommand())
                 return false;
             NavigationDispatched = true; // Set before awaiting: a timed-out remote command may still execute.
-            var accepted = await BoundedMediaCommand.InvokeAsync(ct => Session.TrySkipPreviousAsync().AsTask(ct), "guarded Previous", cancellationToken);
+            var accepted = await BoundedMediaCommand.InvokeAsync(ct => _owner.CanDispatchAudioCommand()
+                ? Session.TrySkipPreviousAsync().AsTask(ct) : Task.FromResult(false), "guarded Previous", cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             _owner._logger.Info($"Previous-restart actual Previous API returned {accepted} on {_identity}.");
             return accepted;
@@ -1398,10 +1413,11 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 _owner._logger.Warn("Previous-restart correction blocked: fresh captured-session predecessor, pause or queue mode no longer matched.");
                 return false;
             }
-            if (!IsCapturedSession() || NavigationChanged())
+            if (!IsCapturedSession() || NavigationChanged() || !_owner.CanDispatchAudioCommand())
                 return false;
             NavigationDispatched = true;
-            var accepted = await BoundedMediaCommand.InvokeAsync(ct => Session.TrySkipNextAsync().AsTask(ct), "guarded Next", cancellationToken);
+            var accepted = await BoundedMediaCommand.InvokeAsync(ct => _owner.CanDispatchAudioCommand()
+                ? Session.TrySkipNextAsync().AsTask(ct) : Task.FromResult(false), "guarded Next", cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             _owner._logger.Info($"Previous-restart actual correcting Next API returned {accepted} on {_identity}.");
             return accepted;
@@ -1430,7 +1446,8 @@ public sealed class AppleMusicTrackSource : ITrackSource, IMediaTransportControl
                 _owner._logger.Warn("Previous-restart activation Play blocked: current captured-session item, pause or Play capability changed.");
                 return false;
             }
-            var accepted = await BoundedMediaCommand.InvokeAsync(ct => Session.TryPlayAsync().AsTask(ct), "guarded activation Play", cancellationToken);
+            var accepted = await BoundedMediaCommand.InvokeAsync(ct => _owner.CanDispatchAudioCommand()
+                ? Session.TryPlayAsync().AsTask(ct) : Task.FromResult(false), "guarded activation Play", cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             _owner._logger.Info($"Previous-restart captured-session activation Play API returned {accepted} on {_identity}; endpoint must remain muted.");
             return accepted;

@@ -22,11 +22,8 @@ public static class Program
             ManualRestartHandoff.RunHelperAsync(args[1]).GetAwaiter().GetResult();
             return;
         }
-        VelopackApp.Build().Run();
-
-        // Must run before App is constructed: its field initializers create the logger, which
-        // creates the new data folder and would shadow files still at the legacy location.
-        AppDataPaths.MigrateFromLegacyLocation();
+        // This manually launched acceptance build has no install/update lifecycle and never
+        // migrates or reads the installed application's data.
         LoadUiLanguage();
 
         var app = new App();

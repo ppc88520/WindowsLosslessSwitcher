@@ -37,12 +37,25 @@ public partial class App : Application
     private string? _lastArtworkRevision;
     private System.Windows.Threading.DispatcherTimer? _artworkRecheckTimer;
     private System.Windows.Threading.DispatcherTimer? _playbackRefreshTimer;
+    private System.Windows.Threading.DispatcherTimer? _audioOutputRefreshTimer;
+    private IAudioOutputGuard? _audioOutputGuard;
+    private int _audioOutputRefreshInFlight;
+    private bool _exiting;
+    private BackgroundUiRefresh<DeviceUiSnapshot>? _deviceUiRefresh;
+    private readonly CancellationTokenSource _dacLockLifetime = new();
+    private Task _dacLockWorker = Task.CompletedTask;
+    private bool _canRestoreOriginalFormat;
+    private AudioOutputGuardState? _lastUiSafetyState;
+    private bool _exitInProgress;
+    private Task _audioOutputSafetyWorker = Task.CompletedTask;
+    private Task _startupBackendWorker = Task.CompletedTask;
+    private Task _restoreWorker = Task.CompletedTask;
     private int _artworkRechecksRemaining;
     private string? _storefront;
 
     public App()
     {
-        _appUpdater = new AppUpdater(_logger);
+        _appUpdater = new IsolatedAppUpdater();
     }
 
     protected override async void OnStartup(StartupEventArgs e)
@@ -70,6 +83,8 @@ public partial class App : Application
         _logger.Info($"OS version: {Environment.OSVersion.Version} ({(Environment.Is64BitOperatingSystem ? "64-bit" : "32-bit")}, {System.Runtime.InteropServices.RuntimeInformation.OSArchitecture}).");
 
         _settings = _settingsService.Load();
+        TestBuildProfile.ApplyFirstRunDefaults(_settings, System.IO.File.Exists(_settingsService.GetSettingsPath()));
+        TestBuildProfile.EnforceIsolation(_settings);
         _viewModel.UiLanguage = _settings.UiLanguage;
         _logger.VerboseEnabled = _settings.EnableVerboseDiagnostics;
         _viewModel.SelectedMode = _settings.DeviceSelectionMode;
@@ -88,7 +103,7 @@ public partial class App : Application
         _viewModel.SeedAllowedFormats(_settings.AllowedSampleRates, _settings.AllowedBitDepths);
         UpdateOriginalFormatRestoreState();
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
-        _viewModel.RefreshRequested += RefreshDevices;
+        _viewModel.RefreshRequested += OnRefreshDevicesRequested;
         _viewModel.ExportDiagnosticsRequested += OnExportDiagnosticsRequested;
         _viewModel.CheckForUpdatesRequested += OnCheckForUpdatesRequested;
         _viewModel.RunUpdatePrimaryActionRequested += OnRunUpdatePrimaryActionRequested;
@@ -98,6 +113,8 @@ public partial class App : Application
         _viewModel.OpenSettingsWindowRequested += ShowSettingsWindow;
         _viewModel.RestartToolRequested += OnRestartToolRequested;
         _viewModel.RestartPlayerAndToolRequested += OnRestartPlayerAndToolRequested;
+        _viewModel.DacLockToggleRequested += OnDacLockToggleRequested;
+        _viewModel.UpdateDacLockState(_settings.DacLockPaused, false);
 
         _trayIconHost = new TrayIconHost();
         _trayIconHost.OpenRequested += ShowMainWindow;
@@ -115,7 +132,13 @@ public partial class App : Application
         //    LocalDeviceMaxResolver applies the actual format read from the track's PlayCache file,
         //    or the device's highest supported format when the file can't be read.
         // 4. TierFallbackResolver is the terminal safety net when there is no usable device.
-        var audioEndpointController = new CoreAudioEndpointController();
+        var nativeAudioController = await Task.Run(() => new CoreAudioEndpointController());
+        if (_exiting) return;
+        var audioEndpointController = await Task.Run(() =>
+            new DacOnlyAudioEndpointController(nativeAudioController, nativeAudioController));
+        if (_exiting) return;
+        _audioOutputGuard = audioEndpointController;
+        audioEndpointController.SetRoutingPaused(_settings.DacLockPaused);
         var formatCacheStore = new FormatCacheStore(_logger);
         _formatCacheStore = formatCacheStore;
         var catalogResolver = new AppleMusicCatalogResolver(_logger, formatCacheStore, _settings.AppleMusicStorefront);
@@ -140,12 +163,15 @@ public partial class App : Application
                 new TierFallbackResolver(_paths, _plistReader, _logger),
             ]);
 
-        var appleMusicTrackSource = new AppleMusicTrackSource(_logger);
+        var appleMusicTrackSource = new AppleMusicTrackSource(_logger)
+        {
+            AudioOutputReady = () => audioEndpointController.IsReady,
+        };
         _trackSource = appleMusicTrackSource;
-        _audioMonitor = new AppleMusicAudioMonitor(_logger, appleMusicTrackSource);
+        _audioMonitor = new AppleMusicAudioMonitor(_logger, appleMusicTrackSource, () => audioEndpointController.IsReady);
         _storefront = catalogResolver.Storefront;
         _viewModel.SeedStorefrontInfo(catalogResolver.Storefront);
-        var processController = new AppleMusicProcessController(_logger);
+        var processController = new AppleMusicProcessController(_logger, () => audioEndpointController.IsReady);
         _coordinator = new SwitchingCoordinator(
             appleMusicTrackSource,
             appleMusicTrackSource,
@@ -157,42 +183,72 @@ public partial class App : Application
             catalogResolverForCacheVerification);
         _coordinator.StatusChanged += OnCoordinatorStatusChanged;
         _coordinator.FormatCacheUpdated += OnFormatCacheUpdated;
+        _coordinator.InitializeOutputLockPaused(_settings.DacLockPaused);
 
         _mainWindow = new HeroWindow(_viewModel, _audioMonitor);
+        _mainWindow.Title = TestBuildProfile.DisplayName;
         _mainWindow.WindowHidden += () => _trayIconHost?.UpdateStatus(_viewModel.ResolverStatusText);
         MainWindow = _mainWindow;
+        _deviceUiRefresh = new BackgroundUiRefresh<DeviceUiSnapshot>(QueryDeviceUiSnapshot,
+            ApplyDeviceUiSnapshot, new System.Windows.Threading.DispatcherSynchronizationContext(Dispatcher),
+            ex => _logger.Warn("Device display refresh failed: " + ex.Message));
+        // The visible shell stays responsive while native device discovery/probing runs.
+        if (!launchMinimized) ShowMainWindow();
 
         // Seed settings before the track source starts so target-device UI and original-format capture
         // use the user's configured selection immediately.
         _coordinator.UpdateSettings(_settings);
-        RefreshDevices();
-        CaptureOriginalTargetFormatIfMissing();
+        var initialSafety = Task.Run(_coordinator.RefreshAudioOutputSafety);
+        _audioOutputSafetyWorker = initialSafety;
+        var initialState = await initialSafety;
+        if (_exiting) return;
+        ApplyAudioOutputSafety(initialState, refreshProjection: false);
+        await _deviceUiRefresh.RequestAsync();
+        if (_exiting) return;
         UpdateFormatCacheStatus();
         await _appUpdater.InitializeAsync(CancellationToken.None);
-        if (e.Args.Contains(ManualRestartHandoff.StartupArgument, StringComparer.Ordinal))
+        if (_exiting) return;
+        if (!_settings.DacLockPaused && e.Args.Contains(ManualRestartHandoff.StartupArgument, StringComparer.Ordinal))
         {
             // This temporary source has no coordinator subscribers: it cannot switch or Play.
             var paused = false;
-            try { paused = await Task.Run(ConfirmRestartStartupPauseAsync).WaitAsync(TimeSpan.FromSeconds(14)); }
+            try
+            {
+                var pauseCheck = Task.Run(ConfirmRestartStartupPauseAsync);
+                _startupBackendWorker = pauseCheck;
+                paused = await pauseCheck.WaitAsync(TimeSpan.FromSeconds(14));
+            }
             catch (Exception ex) { _logger.Warn("Restart startup pause was not confirmed: " + ex.Message); }
+            if (_exiting) return;
             if (!paused)
             {
                 // Attach only for a later explicit retry; automatic switching stays stopped.
-                await _trackSource!.StartAsync(CancellationToken.None);
+                _startupBackendWorker = Task.Run(() => _trackSource!.StartAsync(CancellationToken.None));
+                await _startupBackendWorker;
+                if (_exiting) return;
                 _viewModel.SetLifecycleNotice("Automatic switching is paused after restart", "Apple Music could not be confirmed paused. Pause it manually, then choose Restart Tool. No format, navigation, or Play command will be issued.");
                 ShowMainWindow();
                 return;
             }
             _coordinator.WaitForUserPlaybackAfterManualRestart();
         }
-        await _coordinator.StartAsync(_settings, CancellationToken.None);
-        _viewModel.Playback.Configure(_coordinator, processController);
+        _startupBackendWorker = Task.Run(() => _coordinator.StartAsync(_settings, CancellationToken.None));
+        await _startupBackendWorker;
+        if (_exiting) return;
+        _viewModel.Playback.Configure(_coordinator, processController,
+            new System.Windows.Threading.DispatcherSynchronizationContext(Dispatcher));
         _playbackRefreshTimer = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromMilliseconds(750),
         };
         _playbackRefreshTimer.Tick += (_, _) => _viewModel.Playback.Refresh();
         _playbackRefreshTimer.Start();
+        _audioOutputRefreshTimer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromMilliseconds(500),
+        };
+        _audioOutputRefreshTimer.Tick += async (_, _) => await RefreshAudioOutputSafetyAsync();
+        _audioOutputRefreshTimer.Start();
         if (e.Args.Contains("--manual-player-restart-failed", StringComparer.Ordinal))
             _viewModel.SetLifecycleNotice("Tool restarted; player restart not confirmed", "Check Apple Music, select a track, and press Play manually. The restart will not be retried automatically.");
         ApplyStartupRegistration();
@@ -204,19 +260,24 @@ public partial class App : Application
         }
     }
 
-    protected override async void OnExit(ExitEventArgs e)
+    protected override void OnExit(ExitEventArgs e)
     {
+        _exiting = true;
+        _deviceUiRefresh?.Dispose();
+        _audioOutputRefreshTimer?.Stop();
         _playbackRefreshTimer?.Stop();
         _viewModel.Playback.Dispose();
         _viewModel.DetachLocalization();
+        _viewModel.DacLockToggleRequested -= OnDacLockToggleRequested;
+        _dacLockLifetime.Dispose();
         if (_coordinator is not null)
         {
             _coordinator.StatusChanged -= OnCoordinatorStatusChanged;
             _coordinator.FormatCacheUpdated -= OnFormatCacheUpdated;
-            await _coordinator.DisposeAsync();
+            // Normal exits complete the native cleanup barrier before calling Shutdown.
+            // Startup rejection has no coordinator/owned mute to clean up.
         }
 
-        _audioMonitor?.Dispose();
         _trayIconHost?.Dispose();
         _switchToastService?.Dispose();
         _artworkRecheckTimer?.Stop();
@@ -237,14 +298,14 @@ public partial class App : Application
 
     private void OnCoordinatorStatusChanged(object? sender, SwitchingStatus status)
     {
-        if (_manualRestartInProgress) return;
+        if (_exiting || _manualRestartInProgress) return;
         _latestStatus = status;
         // BeginInvoke (not Invoke): a synchronous dispatch blocks the coordinator's switching
         // pipeline for hundreds of milliseconds per status update, delaying the track-change
         // mute/pause and letting the new track play audibly at the old format.
         Dispatcher.BeginInvoke(() =>
         {
-            if (_manualRestartInProgress) return;
+            if (_exiting || _manualRestartInProgress) return;
             _viewModel.UpdateStatus(status);
             _viewModel.Playback.Refresh();
             if (_recoveryNotifications.ShouldNotify(status))
@@ -252,9 +313,8 @@ public partial class App : Application
                 var advice = RecoveryAdvice.From(status);
                 _trayIconHost?.ShowRecoveryNotification(LocalizationService.Current[advice.Title], LocalizationService.Current[advice.Message]);
             }
-            UpdateActiveTargetCapabilities();
             _trayIconHost?.UpdateStatus(_viewModel.PhaseText);
-            RefreshCurrentFormatDisplays();
+            RefreshDevices();
             UpdateArtworkIfChanged();
             ScheduleArtworkRechecks();
 
@@ -384,6 +444,7 @@ public partial class App : Application
         _settings.RestartAppleMusicOnPlaybackFailure = _viewModel.RestartAppleMusicOnPlaybackFailure;
         _settings.AllowedSampleRates = _viewModel.AllowedSampleRates.ToList();
         _settings.AllowedBitDepths = _viewModel.AllowedBitDepths.ToList();
+        TestBuildProfile.EnforceIsolation(_settings);
         _settingsService.Save(_settings);
         _logger.VerboseEnabled = _settings.EnableVerboseDiagnostics;
         _coordinator?.UpdateSettings(_settings);
@@ -441,18 +502,159 @@ public partial class App : Application
 
     private void RefreshDevices()
     {
-        var devices = _coordinator?.GetRenderDevices() ?? Array.Empty<AudioDeviceInfo>();
-        _viewModel.ReplaceDevices(devices);
-        if (string.IsNullOrWhiteSpace(_viewModel.SelectedDeviceId))
-        {
-            _viewModel.SelectedDeviceId = devices.FirstOrDefault(device => device.IsDefault)?.Id;
-        }
-
-        UpdateActiveTargetCapabilities(forceRefresh: true);
-        RefreshCurrentFormatDisplays();
+        if (!_exiting && _deviceUiRefresh is not null) _ = _deviceUiRefresh.RequestAsync();
     }
 
-    private void CaptureOriginalTargetFormatIfMissing()
+    private async void OnRefreshDevicesRequested()
+    {
+        if (_audioOutputGuard is { } guard) await Task.Run(guard.ResetRoutingAttempt);
+        await RefreshAudioOutputSafetyAsync();
+        if (!_exiting && _deviceUiRefresh is not null) await _deviceUiRefresh.RequestAsync(forceRefresh: true);
+    }
+
+    private async void OnDacLockToggleRequested(bool paused)
+    {
+        if (_exiting || _viewModel.IsRestartBusy || _coordinator is not { } coordinator ||
+            coordinator.IsDacLockChangeInProgress) return;
+        _deviceUiRefresh?.Invalidate();
+        try
+        {
+            // The method's synchronous prefix closes the routing gate immediately.
+            var worker = coordinator.SetOutputLockPausedAsync(paused, _dacLockLifetime.Token);
+            _dacLockWorker = worker;
+            PersistDacLockPreference(coordinator.IsDacLockPaused);
+            UpdateDacLockProjection();
+            _audioMonitor?.RefreshOutputSafety();
+            var result = await worker;
+            if (_exiting) return;
+            PersistDacLockPreference(result.IsPaused);
+            UpdateDacLockProjection();
+            ApplyAudioOutputSafety(_audioOutputGuard?.CurrentState);
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            _logger.Error("DAC lock change did not complete.", ex);
+            if (!_exiting)
+                _viewModel.UpdateDacLockState(coordinator.IsDacLockPaused, false,
+                    "DAC lock change did not complete. Check the safety guidance.");
+        }
+        finally
+        {
+            if (!_exiting)
+            {
+                PersistDacLockPreference(coordinator.IsDacLockPaused);
+                UpdateDacLockProjection();
+                _viewModel.Playback.Refresh();
+                RefreshDevices();
+            }
+        }
+    }
+
+    private void UpdateDacLockProjection()
+    {
+        if (_coordinator is not { } coordinator) return;
+        _viewModel.UpdateDacLockState(coordinator.IsDacLockPaused,
+            coordinator.IsDacLockChangeInProgress, coordinator.DacLockStatusMessage);
+    }
+
+    private void PersistDacLockPreference(bool paused)
+    {
+        if (_settings is null || _settings.DacLockPaused == paused) return;
+        var previous = _settings.DacLockPaused;
+        _settings.DacLockPaused = paused;
+        try { _settingsService.Save(_settings); }
+        catch (Exception ex)
+        {
+            _settings.DacLockPaused = previous;
+            _logger.Error("Could not save the DAC lock preference.", ex);
+            _viewModel.SetLifecycleNotice("DAC lock preference was not saved",
+                "The current lock state is active for this session, but it could not be saved for the next launch.");
+        }
+    }
+
+    private async Task RefreshAudioOutputSafetyAsync()
+    {
+        if (_exiting || _manualRestartInProgress || _coordinator is not { } coordinator ||
+            Interlocked.Exchange(ref _audioOutputRefreshInFlight, 1) != 0) return;
+        try
+        {
+            var worker = Task.Run(coordinator.RefreshAudioOutputSafety);
+            _audioOutputSafetyWorker = worker;
+            var state = await worker;
+            if (!_exiting && ReferenceEquals(_coordinator, coordinator)) ApplyAudioOutputSafety(state);
+        }
+        catch (ObjectDisposedException) { }
+        catch (Exception ex)
+        {
+            _logger.Warn("DAC safety refresh failed: " + ex.Message);
+            if (!_exiting) _viewModel.UpdateAudioOutputSafety(false, null, "DAC identity or default output could not be verified.");
+        }
+        finally { Interlocked.Exchange(ref _audioOutputRefreshInFlight, 0); }
+    }
+
+    private void ApplyAudioOutputSafety(AudioOutputGuardState? state, bool refreshProjection = true)
+    {
+        if (state is null) return;
+        UpdateDacLockProjection();
+        var changed = state != _lastUiSafetyState;
+        _lastUiSafetyState = state;
+        _viewModel.UpdateAudioOutputSafety(state.IsReady, state.Device?.FriendlyName, state.Detail);
+        _audioMonitor?.RefreshOutputSafety();
+        UpdateOriginalFormatRestoreState();
+        if (changed && refreshProjection)
+        {
+            _deviceUiRefresh?.Invalidate();
+            RefreshDevices();
+        }
+        _viewModel.Playback.Refresh();
+    }
+
+    private DeviceUiSnapshot QueryDeviceUiSnapshot(bool forceRefresh)
+    {
+        var coordinator = _coordinator;
+        if (_exiting || coordinator is null)
+            return new(null, 0, [], new(null, []), new(null, null, null), false, false);
+        var guard = _audioOutputGuard;
+        var version = guard?.StateVersion ?? 0;
+        var devices = coordinator.GetRenderDevices();
+        // Capture the pre-switch format before the first capability probe. Startup waits
+        // asynchronously for this one projection before attaching the track source.
+        var format = coordinator.GetCurrentTargetDeviceFormat();
+        var capabilities = coordinator.GetCurrentTargetDeviceCapabilities(forceRefresh);
+        var restoreAllowed = _settings?.OriginalTarget is { } original &&
+            guard?.IsReadyForDevice(original.DeviceId) == true;
+        return new(coordinator, version, devices, capabilities, format, restoreAllowed,
+            version == (guard?.StateVersion ?? 0));
+    }
+
+    private void ApplyDeviceUiSnapshot(DeviceUiSnapshot snapshot)
+    {
+        if (_exiting || !ReferenceEquals(snapshot.Coordinator, _coordinator)) return;
+        if (!snapshot.IsCurrent || snapshot.SafetyVersion != (_audioOutputGuard?.StateVersion ?? 0) ||
+            (snapshot.Capabilities.DeviceName is not null && _audioOutputGuard?.IsSnapshotReady == false))
+        {
+            // Device notification invalidated an in-flight query. Never display its old target.
+            _viewModel.UpdateActiveTargetCapabilities(new(null, []));
+            _viewModel.UpdateCurrentDeviceFormat(null);
+            _canRestoreOriginalFormat = false;
+            UpdateOriginalFormatRestoreState();
+            RefreshDevices();
+            return;
+        }
+        _viewModel.ReplaceDevices(snapshot.Devices);
+        _viewModel.UpdateActiveTargetCapabilities(snapshot.Capabilities);
+        _viewModel.UpdateCurrentDeviceFormat(snapshot.Format.Format);
+        _canRestoreOriginalFormat = snapshot.RestoreAllowed;
+        CaptureOriginalTargetFormatIfMissing(snapshot.Format);
+        UpdateOriginalFormatRestoreState();
+    }
+
+    private sealed record DeviceUiSnapshot(SwitchingCoordinator? Coordinator, long SafetyVersion,
+        IReadOnlyList<AudioDeviceInfo> Devices, CurrentTargetDeviceCapabilitiesSnapshot Capabilities,
+        CurrentTargetDeviceFormatSnapshot Format, bool RestoreAllowed, bool IsCurrent);
+
+    private void CaptureOriginalTargetFormatIfMissing(CurrentTargetDeviceFormatSnapshot snapshot)
     {
         if (_settings is null || _coordinator is null)
         {
@@ -465,7 +667,6 @@ public partial class App : Application
             return;
         }
 
-        var snapshot = _coordinator.GetCurrentTargetDeviceFormat();
         if (string.IsNullOrWhiteSpace(snapshot.DeviceId) || snapshot.Format is null)
         {
             _logger.Warn("Original target format capture skipped because no target device format is available yet.");
@@ -480,6 +681,7 @@ public partial class App : Application
             snapshot.Format.BitDepth,
             snapshot.Format.Channels,
             DateTimeOffset.UtcNow);
+        _canRestoreOriginalFormat = true;
         _settingsService.Save(_settings);
         _logger.Info($"Captured original target format {snapshot.Format.DisplayName} for {snapshot.DeviceName ?? snapshot.DeviceId}.");
         _viewModel.AddActivity($"Original format captured: {AudioFormatTextFormatter.Format(snapshot.Format)}");
@@ -488,7 +690,7 @@ public partial class App : Application
 
     private async Task RestoreOriginalFormatAsync()
     {
-        if (_settings is null || _coordinator is null)
+        if (_exiting || _settings is null || _coordinator is null)
         {
             return;
         }
@@ -512,11 +714,15 @@ public partial class App : Application
         using var restoreTimeoutCts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         try
         {
-            var result = await _coordinator.RestoreOriginalFormatAsync(
+            var coordinator = _coordinator;
+            var worker = Task.Run(() => coordinator.RestoreOriginalFormatAsync(
                 originalTarget.DeviceId,
                 originalTarget.DeviceName,
                 originalFormat,
-                restoreTimeoutCts.Token);
+                restoreTimeoutCts.Token));
+            _restoreWorker = worker;
+            var result = await worker;
+            if (_exiting) return;
 
             _viewModel.OriginalFormatText = result.Succeeded
                 ? $"Restored original format. Saved original: {BuildOriginalFormatText(_settings)}"
@@ -529,18 +735,21 @@ public partial class App : Application
         catch (OperationCanceledException) when (restoreTimeoutCts.IsCancellationRequested)
         {
             _logger.Warn("Restore original format timed out.");
-            _viewModel.OriginalFormatText = "Restore timed out.";
+            if (!_exiting) _viewModel.OriginalFormatText = "Restore timed out.";
         }
         catch (Exception ex)
         {
             _logger.Error("Restore original format failed unexpectedly.", ex);
-            _viewModel.OriginalFormatText = $"Restore failed: {ex.Message}";
+            if (!_exiting) _viewModel.OriginalFormatText = $"Restore failed: {ex.Message}";
         }
         finally
         {
-            _viewModel.CanRestoreOriginalFormat = TryGetOriginalTargetFormat(_settings, out _);
-            UpdateActiveTargetCapabilities(forceRefresh: true);
-            RefreshCurrentFormatDisplays();
+            if (!_exiting)
+            {
+                UpdateOriginalFormatRestoreState();
+                UpdateActiveTargetCapabilities(forceRefresh: true);
+                RefreshCurrentFormatDisplays();
+            }
         }
     }
 
@@ -554,7 +763,8 @@ public partial class App : Application
         }
 
         _viewModel.OriginalFormatText = statusOverride ?? BuildOriginalFormatText(_settings);
-        _viewModel.CanRestoreOriginalFormat = TryGetOriginalTargetFormat(_settings, out _);
+        _viewModel.CanRestoreOriginalFormat = TryGetOriginalTargetFormat(_settings, out _) &&
+            _canRestoreOriginalFormat && _audioOutputGuard?.IsSnapshotReady == true;
     }
 
     private static string BuildOriginalFormatText(AppSettings settings)
@@ -599,12 +809,7 @@ public partial class App : Application
 
     private void ApplyStartupRegistration()
     {
-        if (_settings is null || string.IsNullOrWhiteSpace(Environment.ProcessPath))
-        {
-            return;
-        }
-
-        _startupRegistrationService.SetEnabled(_settings.LaunchAtLogin, Environment.ProcessPath);
+        // Portable acceptance build never writes the installed application's Run entry.
     }
 
     private void ShowMainWindow()
@@ -655,6 +860,7 @@ public partial class App : Application
             }
 
             _settingsWindow = new SettingsWindow(_viewModel, _audioMonitor);
+            _settingsWindow.Title = TestBuildProfile.DisplayName;
         }
 
         _settingsWindow.Show();
@@ -667,12 +873,18 @@ public partial class App : Application
 
     private async Task RestartManuallyAsync(ManualRestartMode mode)
     {
+        if (_coordinator?.IsDacLockChangeInProgress == true) return;
         if (_manualRestartInProgress || _viewModel.IsRestartBusy || _viewModel.Playback.IsBusy || _coordinator is null) return;
         _viewModel.IsRestartBusy = true;
         _viewModel.Playback.SetRestartBusy(true);
         string? requestPath = null;
         try
         {
+            if (mode == ManualRestartMode.AppleMusicAndTool && _audioOutputGuard?.IsSnapshotReady != true)
+            {
+                _viewModel.SetLifecycleNotice("Waiting for a supported DAC", "Apple Music restart is unavailable until a supported DAC is connected and confirmed as the default output.");
+                return;
+            }
             // IsRestartBusy claims both commands during the modal loop. Ordinary status
             // updates remain visible until the user confirms, including after Cancel.
             if (mode == ManualRestartMode.AppleMusicAndTool && LocalizedDialog.Show(
@@ -690,6 +902,9 @@ public partial class App : Application
                 _viewModel.SetLifecycleNotice("Restart stopped: pause not confirmed", "Automatic processing has been suspended. Pause Apple Music manually, then retry. The application was not forcibly closed and its protective mute was not released.");
                 return;
             }
+            if (mode == ManualRestartMode.AppleMusicAndTool &&
+                !await Task.Run(() => _audioOutputGuard?.IsReady == true))
+                throw new InvalidOperationException("DAC output was lost before Apple Music restart.");
             requestPath = await ManualRestartHandoff.StartHelperAsync(mode, CancellationToken.None);
             // The user could have pressed Play while the helper started. Recheck before
             // Dispose releases owned mute, using the same bounded preparation barrier.
@@ -697,7 +912,7 @@ public partial class App : Application
                     noPlayerProcess: !ManualRestartHandoff.IsAppleMusicRunning())).WaitAsync(TimeSpan.FromSeconds(4)))
                 throw new InvalidOperationException("Apple Music was no longer confirmed paused before exit.");
             // Explicit cleanup is the barrier; WPF's async-void OnExit cannot provide it.
-            await coordinator.DisposeAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(15));
+            await Task.Run(async () => await coordinator.DisposeAsync()).WaitAsync(TimeSpan.FromSeconds(15));
             _coordinator = null;
             ExitApplication();
         }
@@ -730,19 +945,75 @@ public partial class App : Application
         return false;
     }
 
-    private void ExitApplication()
+    private async void ExitApplication()
     {
-        if (_manualRestartInProgress && _coordinator is not null) return;
-        _mainWindow?.AllowCloseAndClose();
-        _settingsWindow?.AllowCloseAndClose();
-        Shutdown();
+        if (_exitInProgress || (_manualRestartInProgress && _coordinator is not null)) return;
+        _exitInProgress = true;
+        _exiting = true;
+        _dacLockLifetime.Cancel();
+        _coordinator?.RequestShutdown();
+        _audioOutputRefreshTimer?.Stop();
+        _playbackRefreshTimer?.Stop();
+        _artworkRecheckTimer?.Stop();
+        _deviceUiRefresh?.Dispose();
+        _viewModel.Playback.Dispose();
+        try
+        {
+            var coordinator = _coordinator;
+            var monitor = _audioMonitor;
+            var guard = _audioOutputGuard as IDisposable;
+            var deviceDisplaysDrained = _deviceUiRefresh?.DrainAsync() ?? Task.CompletedTask;
+            var playbackDisplaysDrained = _viewModel.Playback.DrainAsync();
+            var safetyWorker = _audioOutputSafetyWorker;
+            var startupWorker = _startupBackendWorker;
+            var restoreWorker = _restoreWorker;
+            var dacLockWorker = _dacLockWorker;
+            await AsyncShutdownSequence.RunAsync(async () =>
+            {
+                // A disposed pump suppresses future work/UI application, but its current
+                // native call may still be finishing. Drain before disposing shared audio state.
+                await Task.WhenAll(new[] { deviceDisplaysDrained, playbackDisplaysDrained,
+                    safetyWorker, startupWorker, restoreWorker, dacLockWorker }.Select(AwaitWorkerCompletionAsync)).ConfigureAwait(false);
+                if (coordinator is not null)
+                {
+                    coordinator.StatusChanged -= OnCoordinatorStatusChanged;
+                    coordinator.FormatCacheUpdated -= OnFormatCacheUpdated;
+                    await coordinator.DisposeAsync();
+                }
+                monitor?.Dispose();
+                guard?.Dispose();
+            }, () =>
+            {
+                if (coordinator is not null) PersistDacLockPreference(coordinator.IsDacLockPaused);
+                _coordinator = null;
+                _audioMonitor = null;
+                _audioOutputGuard = null;
+                _mainWindow?.AllowCloseAndClose();
+                _settingsWindow?.AllowCloseAndClose();
+                Shutdown();
+            });
+        }
+        catch (Exception ex)
+        {
+            // A failed cleanup cannot authorize destroying the process before mute release.
+            _logger.Error("Application cleanup did not complete; shutdown was stopped.", ex);
+            _exitInProgress = false;
+            _viewModel.SetLifecycleNotice("Exit did not complete", "Pause Apple Music and retry Exit. Native cleanup did not complete: " + ex.Message);
+        }
+    }
+
+    private static async Task AwaitWorkerCompletionAsync(Task worker)
+    {
+        // A read that already failed has finished touching native state. Its failure is
+        // reported at the query boundary and must not prevent the actual cleanup below.
+        try { await worker.ConfigureAwait(false); }
+        catch { }
     }
 
     /// <summary>Pushes the current target-device format to the view model (flyout chip, "was" seed).</summary>
     private void RefreshCurrentFormatDisplays()
     {
-        var format = _coordinator?.GetCurrentTargetDeviceFormat().Format;
-        _viewModel.UpdateCurrentDeviceFormat(format);
+        RefreshDevices();
     }
 
     private void UpdateFormatCacheStatus()
@@ -866,9 +1137,7 @@ public partial class App : Application
 
     private void UpdateActiveTargetCapabilities(bool forceRefresh = false)
     {
-        var snapshot = _coordinator?.GetCurrentTargetDeviceCapabilities(forceRefresh) ??
-            new CurrentTargetDeviceCapabilitiesSnapshot(null, []);
-        _viewModel.UpdateActiveTargetCapabilities(snapshot);
+        if (!_exiting && _deviceUiRefresh is not null) _ = _deviceUiRefresh.RequestAsync(forceRefresh);
     }
 
     private async Task CheckForUpdatesAsync(bool userInitiated)

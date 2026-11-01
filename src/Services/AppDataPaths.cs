@@ -8,10 +8,10 @@ namespace WindowsLosslessSwitcher.Services;
 /// </summary>
 public static class AppDataPaths
 {
-    private const string AppFolderName = "WindowsLosslessSwitcher";
+    private const string AppFolderName = TestBuildProfile.DataFolderName;
 
     /// <summary>
-    /// Root folder for app data: %APPDATA%\WindowsLosslessSwitcher.
+    /// Root folder for isolated data: %APPDATA%\WindowsLosslessSwitcher.DacGuardTest.
     /// </summary>
     public static string RootDirectory =>
         Path.Combine(
@@ -41,7 +41,9 @@ public static class AppDataPaths
     /// Update.exe) that may share the legacy folder.
     /// </summary>
     public static void MigrateFromLegacyLocation()
-        => MigrateFromLegacyLocation(LegacyRootDirectory, RootDirectory);
+    {
+        // This standalone build must never import or move installed/legacy user data.
+    }
 
     internal static void MigrateFromLegacyLocation(string legacyRoot, string newRoot)
     {

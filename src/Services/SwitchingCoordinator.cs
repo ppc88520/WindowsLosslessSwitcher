@@ -260,7 +260,9 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
         IFormatResolver? catalogResolverForCacheVerification = null)
     {
         _trackSource = trackSource;
-        _mediaTransportController = mediaTransportController;
+        _audioOutputGuard = audioEndpointController as IAudioOutputGuard;
+        _mediaTransportController = _audioOutputGuard is null ? mediaTransportController :
+            new DacGuardedMediaTransportController(mediaTransportController, IsAudioOutputReady);
         _playbackStateNotifier = mediaTransportController as IPlaybackStateNotifier ?? trackSource as IPlaybackStateNotifier;
         _resolverChain = resolverChain;
         if (formatCacheStore is not null && catalogResolverForCacheVerification is not null)
@@ -273,7 +275,8 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
 
         _audioEndpointController = audioEndpointController;
         _logger = logger;
-        _appleMusicProcessController = appleMusicProcessController;
+        _appleMusicProcessController = appleMusicProcessController is null || _audioOutputGuard is null ? appleMusicProcessController :
+            new DacGuardedAppleMusicProcessController(appleMusicProcessController, IsAudioOutputReady);
     }
 
     public event EventHandler<SwitchingStatus>? StatusChanged;
@@ -286,6 +289,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
     {
         Settings = settings;
         PublishStatus(new SwitchingStatus("Resolver: Waiting for Apple Music", null, null, null, null, null));
+        RefreshAudioOutputSafety();
         _trackSource.TrackChanged += OnTrackChanged;
         if (_playbackStateNotifier is not null)
             _playbackStateNotifier.PlaybackStateChanged += OnPlaybackStateChanged;
@@ -320,6 +324,8 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
         await _switchLock.WaitAsync(cancellationToken);
         try
         {
+            if (_dacLockPaused || (_audioOutputGuard is not null && (!IsAudioOutputReady() || !_audioOutputGuard.IsReadyForDevice(deviceId))))
+                return new FormatRestoreResult(false, "Original format restore is blocked: the captured device is not the verified default DAC.", null);
             var targetDevice = _audioEndpointController.GetRenderDevices()
                 .FirstOrDefault(device => device.Id == deviceId);
             var targetDeviceName = targetDevice?.FriendlyName ?? deviceName ?? "captured device";
@@ -400,6 +406,9 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             // No old processing can resume while this flag is set. A failed preparation
             // remains stopped; the user can pause manually and explicitly retry.
             ReadPlaybackState();
+            if (_dacLockPaused && _mutedDeviceId is null &&
+                !_transportPausedByCoordinator && !HasUnconfirmedPlaybackCommand)
+                return true;
             if (HasUnconfirmedPlaybackCommand)
             {
                 HoldAfterUserCommand("Restart was stopped because an earlier playback command may still execute. A reported pause cannot authorize releasing protective mute.");
@@ -464,6 +473,11 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             try
             {
                 await Task.Delay(WatchdogPollInterval, cancellationToken);
+                if (!IsAudioOutputReady())
+                {
+                    inactiveSince = null;
+                    continue;
+                }
 
                 // Stay out of the way while a track is being processed: the pipeline's own
                 // checks own those windows, and pause/mute states would read as wedges here.
@@ -545,7 +559,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
         await _switchLock.WaitAsync(watchdogToken);
         try
         {
-            if (_userPauseRequested || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null || HasDeferredRateSwitch() || HasUserPausedTrack())
+            if (!IsAudioOutputReady() || _userPauseRequested || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null || HasDeferredRateSwitch() || HasUserPausedTrack())
             {
                 return;
             }
@@ -667,7 +681,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
 
     private async void OnPlaybackStateChanged(object? sender, MediaTransportState state)
     {
-        if (_userPauseRequested || _stopping || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null)
+        if (!IsAudioOutputReady() || _userPauseRequested || _stopping || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null)
             return;
         if (!state.IsPlaying)
         {
@@ -837,6 +851,11 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             _logger.Info($"Acquired switch lock after {lockWait.ElapsedMilliseconds} ms.", correlation);
 
             cancellationToken.ThrowIfCancellationRequested();
+            if (!IsAudioOutputReady())
+            {
+                PublishAudioOutputWaiting(_audioOutputGuard?.CurrentState.Detail ?? "Connect a supported DAC to continue.");
+                return;
+            }
             if (_manualRestartRequested || _previousRestartSafetyHold || _stopping)
             {
                 PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Failed", null, track, null, null, GetGlobalHoldMessage()));
@@ -881,7 +900,9 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             var targetSelectionStopwatch = Stopwatch.StartNew();
             var devices = _audioEndpointController.GetRenderDevices();
             var defaultDevice = _audioEndpointController.GetDefaultRenderDevice();
-            var targetDevice = DeviceTargetingPolicy.SelectTargetDevice(Settings, devices, defaultDevice);
+            var targetDevice = _audioOutputGuard is null
+                ? DeviceTargetingPolicy.SelectTargetDevice(Settings, devices, defaultDevice)
+                : GetCurrentTargetDevice();
             _logger.Info(
                 $"Target-device selection completed after {targetSelectionStopwatch.ElapsedMilliseconds} ms. " +
                 $"result={(targetDevice?.FriendlyName ?? "none")}.",
@@ -913,6 +934,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             PublishStatusIfCurrent(generation, new SwitchingStatus("Resolver: Resolving format", targetDevice.FriendlyName, track, null, null, null));
             stage = TrackProcessingStage.ResolvingFormat;
             var resolved = await ResolveFormatAsync(track, cancellationToken);
+            if (!IsAudioOutputReady()) return;
             if (resolved?.Source == AudioFormatSource.CachedCatalog)
             {
                 MaybeScheduleCacheVerification(track, resolved);
@@ -1144,7 +1166,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
                 WasFormatChanged: true);
             PublishStatusIfCurrent(generation, publishedStatus);
         }
-        catch (OperationCanceledException) when (_stopping || cancellationToken.IsCancellationRequested || Volatile.Read(ref _currentTrackGeneration) != generation)
+        catch (OperationCanceledException) when (_audioOutputSafetyHold || _stopping || cancellationToken.IsCancellationRequested || Volatile.Read(ref _currentTrackGeneration) != generation)
         {
             _logger.Info($"Track processing canceled during {DescribeStage(stage)}.", correlation);
             var superseded = Volatile.Read(ref _currentTrackGeneration) != generation;
@@ -1165,6 +1187,11 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
         }
         catch (Exception ex)
         {
+            if (!IsAudioOutputReady())
+            {
+                PublishAudioOutputWaiting(_audioOutputGuard?.CurrentState.Detail ?? "Connect a supported DAC to continue.");
+                return;
+            }
             if (ex is TimeoutException && Settings.RestartTrackAfterSampleRateChange)
             {
                 MuteTargetDeviceForProcessing(_lastTargetDeviceId, correlation);
@@ -1185,7 +1212,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             {
                 // Never leave the device muted unless a superseding track's processing now
                 // owns the mute and will release it itself.
-                if (!_userPauseRequested && !_manualRestartRequested && !_previousRestartSafetyHold && _manualTrackHold is null && Volatile.Read(ref _currentTrackGeneration) == generation)
+                if (!_audioOutputSafetyHold && !_userPauseRequested && !_manualRestartRequested && !_previousRestartSafetyHold && _manualTrackHold is null && Volatile.Read(ref _currentTrackGeneration) == generation)
                 {
                     UnmuteTargetDeviceAfterProcessing(correlation);
                 }
@@ -1349,7 +1376,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
     {
         lock (_muteOwnershipSync)
         {
-            if (_stopping || deviceId is null || _mutedDeviceId is not null)
+            if (_stopping || _dacLockPaused || deviceId is null || _mutedDeviceId is not null)
             {
                 return;
             }
@@ -1373,13 +1400,14 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
         }
     }
 
-    private void UnmuteTargetDeviceAfterProcessing(DiagnosticsLogger.LogCorrelation? correlation = null, bool allowUserPause = false)
+    private void UnmuteTargetDeviceAfterProcessing(DiagnosticsLogger.LogCorrelation? correlation = null, bool allowUserPause = false, bool allowDacLockCleanup = false)
     {
         lock (_muteOwnershipSync)
         {
             // All old paths, including cancellation cleanup, must keep owned mute until
             // an explicit UI Pause has confirmed the player is safely stopped.
             if (_userPauseRequested && !_stopping && !allowUserPause) return;
+            if (_dacLockPaused && !_stopping && !allowDacLockCleanup) return;
             if (_mutedDeviceId is null)
             {
                 return;
@@ -1495,7 +1523,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
 
     private async Task<bool> ResumePlaybackAfterPauseAsync(string? targetDeviceName, CancellationToken cancellationToken)
     {
-        if (_userPauseRequested || _stopping || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null)
+        if (!IsAudioOutputReady() || _userPauseRequested || _stopping || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null)
         {
             return false;
         }
@@ -1521,7 +1549,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             for (var attempt = 1; attempt <= ResumePlayAttemptLimit; attempt++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                if (_userPauseRequested || _stopping || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null)
+                if (!IsAudioOutputReady() || _userPauseRequested || _stopping || _manualRestartRequested || _previousRestartSafetyHold || _manualTrackHold is not null)
                 {
                     return false;
                 }
@@ -1636,6 +1664,11 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
         AudioFormatCandidate? appliedFormat = null;
         void Hold(string reason, RecoveryCategory category = RecoveryCategory.UnsafeState)
         {
+            if (!IsAudioOutputReady())
+            {
+                PublishAudioOutputWaiting(_audioOutputGuard?.CurrentState.Detail ?? "Connect a supported DAC to continue.");
+                return;
+            }
             MuteTargetDeviceForProcessing(targetDevice.Id, correlation);
             if (!_previousRestartSafetyHold)
                 SetPreviousRestartSafetyHold(correlation, reason, category);
@@ -2117,7 +2150,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
         }
         finally
         {
-            if (ownsPause && !resumeAttempted && !_previousRestartSafetyHold && _manualTrackHold is null && !_stopping)
+            if (ownsPause && !resumeAttempted && !_audioOutputSafetyHold && !_previousRestartSafetyHold && _manualTrackHold is null && !_stopping)
             {
                 if (Volatile.Read(ref _currentTrackGeneration) == generation)
                 {
@@ -2176,7 +2209,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
     private void EnsureRestartIsCurrent(long generation, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (_stopping || _manualRestartRequested || Volatile.Read(ref _currentTrackGeneration) != generation)
+        if (!IsAudioOutputReady() || _stopping || _manualRestartRequested || Volatile.Read(ref _currentTrackGeneration) != generation)
         {
             throw new OperationCanceledException("Restart superseded by a newer track.", cancellationToken);
         }
@@ -2658,6 +2691,8 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
 
     private (long Generation, CancellationToken CancellationToken) BeginTrackProcessing(TrackSnapshot track, long? deferredGeneration = null)
     {
+        CancellationTokenSource? superseded;
+        (long Generation, CancellationToken CancellationToken) result;
         lock (_processingSync)
         {
             if (_manualTrackHold is { } held &&
@@ -2673,8 +2708,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             _currentTrackGeneration++;
             _userPausedTrack = null;
             var generation = _currentTrackGeneration;
-            _currentTrackCts?.Cancel();
-            _currentTrackCts?.Dispose();
+            superseded = _currentTrackCts;
             if (!string.IsNullOrWhiteSpace(supersededTrackKey))
             {
                 _logger.Info(
@@ -2688,6 +2722,7 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
                 _precedingTrackSnapshot = _currentTrackSnapshot;
             }
             _currentTrackSnapshot = track;
+            if (!_dacLockPaused) _audioOutputReprocessPending = false;
             _currentTrackKey = track.UniqueKey;
             _deferredRateSwitch = null;
             if (_manualTrackHold is { } previousHold && previousHold.Track.UniqueKey != track.UniqueKey)
@@ -2705,20 +2740,31 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
                     ? "Starting track processing."
                     : $"Starting track processing. Supersedes {supersededTrackKey}.",
                 new DiagnosticsLogger.LogCorrelation(generation, track.UniqueKey));
-            return (generation, _currentTrackCts.Token);
+            result = (generation, _currentTrackCts.Token);
         }
+        CancelAndDispose(superseded);
+        return result;
     }
 
     private void CancelCurrentTrackProcessing()
     {
+        CancellationTokenSource? canceled;
         lock (_processingSync)
         {
-            _currentTrackCts?.Cancel();
-            _currentTrackCts?.Dispose();
+            canceled = _currentTrackCts;
             _currentTrackCts = null;
             _currentTrackKey = null;
             _deferredRateSwitch = null;
         }
+        CancelAndDispose(canceled);
+    }
+
+    private static void CancelAndDispose(CancellationTokenSource? cancellation)
+    {
+        if (cancellation is null) return;
+        try { cancellation.Cancel(); }
+        catch (ObjectDisposedException) { }
+        finally { cancellation.Dispose(); }
     }
 
     private void TrackTaskStarted(Task task)
@@ -2771,7 +2817,27 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
             return;
         }
 
-        if (_previousRestartSafetyHold)
+        if (_dacLockPaused)
+        {
+            status = status with
+            {
+                ResolverStatusText = "DAC lock paused", ActiveDeviceName = null, AppliedFormat = null,
+                WasFormatChanged = false, FailureReason = DacLockStatusMessage, Recovery = RecoveryCategory.None,
+            };
+        }
+        else if (_audioOutputSafetyHold)
+        {
+            status = status with
+            {
+                ResolverStatusText = "Waiting for a supported DAC",
+                ActiveDeviceName = null,
+                AppliedFormat = null,
+                WasFormatChanged = false,
+                FailureReason = _audioOutputGuard?.CurrentState.Detail ?? "Connect a supported DAC to continue.",
+                Recovery = RecoveryCategory.None,
+            };
+        }
+        else if (_previousRestartSafetyHold)
         {
             status = status with { ResolverStatusText = "Resolver: Failed", FailureReason = GetGlobalHoldMessage(), Recovery = _globalRecoveryCategory };
         }
@@ -2882,6 +2948,12 @@ public sealed partial class SwitchingCoordinator : IAsyncDisposable
 
     private AudioDeviceInfo? GetCurrentTargetDevice()
     {
+        if (_dacLockPaused) return null;
+        if (_audioOutputGuard is not null)
+        {
+            if (!IsAudioOutputReady()) return null;
+            return _audioOutputGuard.CurrentState.Device;
+        }
         var devices = _audioEndpointController.GetRenderDevices();
         var defaultDevice = _audioEndpointController.GetDefaultRenderDevice();
         return DeviceTargetingPolicy.SelectTargetDevice(Settings, devices, defaultDevice);

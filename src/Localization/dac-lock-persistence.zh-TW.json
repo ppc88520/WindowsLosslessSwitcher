@@ -1,0 +1,7 @@
+{
+  "Last DAC format": "上次使用的 DAC 格式",
+  "DAC lock preference was not saved": "未能儲存 DAC 鎖定設定",
+  "The current lock state is active for this session, but it could not be saved for the next launch.": "目前的鎖定狀態仍適用於這次執行，但無法儲存供下次啟動使用。",
+  "DAC lock change did not complete. Check the safety guidance.": "DAC 鎖定變更未完成，請查看安全處理提示。",
+  "DAC lock is paused, but the output observer has not stopped. Wait for device discovery to finish, then retry.": "DAC 鎖定已暫停，但裝置檢查尚未停止。請等待裝置辨識完成後再重試。"
+}

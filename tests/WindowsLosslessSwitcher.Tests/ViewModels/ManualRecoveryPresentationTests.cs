@@ -81,7 +81,10 @@ public sealed class ManualRecoveryPresentationTests
     [Fact]
     public void RestartRequiresTheCurrentApplicationHost()
     {
-        Assert.True(ManualRestartHandoff.IsSupportedExecutable("WindowsLosslessSwitcher.exe"));
+        var applicationHost = typeof(ManualRestartHandoff).Assembly.GetName().Name + ".exe";
+        Assert.True(ManualRestartHandoff.IsSupportedExecutable(applicationHost));
+        if (applicationHost != "WindowsLosslessSwitcher.exe")
+            Assert.False(ManualRestartHandoff.IsSupportedExecutable("WindowsLosslessSwitcher.exe"));
         Assert.False(ManualRestartHandoff.IsSupportedExecutable("dotnet.exe"));
         Assert.False(ManualRestartHandoff.IsSupportedExecutable("AnotherApplication.exe"));
     }
